@@ -14,12 +14,12 @@ VSVersionInfo(
       StringTable(
         '080404B0',
         [StringStruct('CompanyName', 'Liu8Can (original) / opt-full fork'),
-         StringStruct('FileDescription', 'PotPlayer DeepSeek Translate Installer'),
+         StringStruct('FileDescription', 'PotPlayer DeepSeek Translate - API Manager'),
          StringStruct('FileVersion', '1.0.0.0'),
-         StringStruct('InternalName', 'installer'),
+         StringStruct('InternalName', 'api_manager'),
          StringStruct('LegalCopyright', 'MIT License'),
-         StringStruct('OriginalFilename', 'installer.exe'),
-         StringStruct('ProductName', 'PotPlayer DeepSeek Translate'),
+         StringStruct('OriginalFilename', 'api_manager.exe'),
+         StringStruct('ProductName', 'PotPlayer DeepSeek Translate API Manager'),
          StringStruct('ProductVersion', '1.0.0.0')])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])

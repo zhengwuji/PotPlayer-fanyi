@@ -299,7 +299,7 @@ def install(strings):
     print(strings["installation_complete"].format(target_path))
 
 
-APP_VERSION = "0.9"
+APP_VERSION = "1.0"
 
 
 def self_check():

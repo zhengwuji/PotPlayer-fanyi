@@ -50,7 +50,7 @@ string GetTitle() {
 }
 
 string GetVersion() {
-    return "0.9";
+    return "1.0";
 }
 
 string GetDesc() {
@@ -171,26 +171,54 @@ string CFG_FILE = "deepseek_api.txt";
 string fileAcct = "";
 string fileKey  = "";
 bool   fileConfigActive = false;
+string cfgUsedPath = "";
+
+string WithSlash(string p) {
+    if (p.empty()) return p;
+    if (p.Right(1) != "\\" && p.Right(1) != "/") p += "\\";
+    return p;
+}
 
 string ConfigFilePath() {
-    string p = HostGetConfigFolder();
-    if (p.empty()) return "";
-    if (p.Right(1) != "\\" && p.Right(1) != "/") p += "\\";
-    return p + CFG_FILE;
+    return WithSlash(HostGetConfigFolder()) + CFG_FILE;
+}
+
+// 依次尝试多个候选位置：配置目录 -> 脚本目录 -> PotPlayer 主程序目录。
+// 这样配套管理器把文件写在哪儿都能被读到，不赌某一个目录。
+array<string> ConfigCandidates() {
+    array<string> v;
+    string c = WithSlash(HostGetConfigFolder());
+    if (!c.empty()) v.insertLast(c + CFG_FILE);
+    string s = WithSlash(HostGetScriptFolder());
+    if (!s.empty()) v.insertLast(s + CFG_FILE);
+    string e = WithSlash(HostGetExecuteFolder());
+    if (!e.empty()) v.insertLast(e + CFG_FILE);
+    return v;
 }
 
 bool LoadConfigFile() {
     fileAcct = "";
     fileKey = "";
     fileConfigActive = false;
+    cfgUsedPath = "";
 
-    string path = ConfigFilePath();
-    if (path.empty()) return false;
-    if (!HostFileExist(path)) {
-        WriteConfigTemplate(path);
+    string path = "";
+    array<string> cands = ConfigCandidates();
+    int ci = 0;
+    while (ci < int(cands.length())) {
+        if (HostFileExist(cands[ci])) {
+            path = cands[ci];
+            break;
+        }
+        ci++;
+    }
+
+    if (path.empty()) {
+        WriteConfigTemplate(ConfigFilePath());
         return false;
     }
 
+    cfgUsedPath = path;
     uintptr fp = HostFileOpen(path);
     if (fp == 0) {
         Dbg("config file exists but could not be opened");
@@ -1256,7 +1284,7 @@ void OnInitialize() {
         } else {
             acctSpec = fa;
             if (!fileKey.empty()) api_key = fileKey;
-            HostPrintUTF8("{$CP0=config source: $}" + CFG_FILE + "\n");
+            HostPrintUTF8("{$CP0=config source: $}" + cfgUsedPath + "\n");
         }
     } else {
         Dbg("config source: saved settings");
