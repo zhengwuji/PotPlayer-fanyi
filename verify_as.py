@@ -830,6 +830,79 @@ def check_models() -> bool:
     return ok
 
 
+def parse_config_file(text: str):
+    """复刻 LoadConfigFile() 的逐行解析，返回 (acct, key, active)"""
+    text = text.replace("\ufeff", "")          # 去掉记事本可能加的 BOM
+    acct = key = ""
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line[0] in "#;":
+            continue
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip().lower(), v.strip()
+        if k in ("account", "user"):
+            acct = v
+        elif k in ("key", "apikey", "api_key"):
+            key = v
+    return acct, key, bool(acct or key)
+
+
+def check_configfile() -> bool:
+    print("  [文本配置通道]")
+    ok = True
+
+    template = (
+        "# PotPlayer DeepSeek Translate - 文本配置\r\n"
+        "#\r\n"
+        "# account : 与界面「账户名称」里填的写法完全一致\r\n"
+        "# key     : API Key\r\n"
+        "#\r\n"
+        "#   account=add=inception; preset=inception\r\n"
+        "#   key=sk-xxxxxxxx\r\n"
+        "\r\n"
+        "account=\r\n"
+        "key=\r\n"
+    )
+    cases = [
+        ("只有注释与空值（模板原样）", template, ("", "", False)),
+        ("正常填写",
+         "# 注释\r\naccount=add=inception; preset=inception\r\nkey=sk_abc123\r\n",
+         ("add=inception; preset=inception", "sk_abc123", True)),
+        ("带 UTF-8 BOM",
+         "\ufeffaccount=preset=zhipu\r\nkey=sk-x\r\n", ("preset=zhipu", "sk-x", True)),
+        ("LF 换行（非 CRLF）",
+         "account=preset=ollama\nkey=\n", ("preset=ollama", "", True)),
+        ("键名大小写与别名",
+         "ACCOUNT=preset=groq\r\nApiKey=sk-y\r\n", ("preset=groq", "sk-y", True)),
+        ("分号注释 + 空行 + 未知键",
+         "; 注释\n\naccount=preset=openai\nunknown=1\nkey=sk-z\n",
+         ("preset=openai", "sk-z", True)),
+        ("只有 key（沿用已保存的 account）", "key=sk-only\r\n", ("", "sk-only", True)),
+        ("没有等号的行被忽略", "garbage line\r\naccount=preset=deepseek\r\n",
+         ("preset=deepseek", "", True)),
+    ]
+    for label, text, want in cases:
+        got = parse_config_file(text)
+        if got != want:
+            print(f"    [FAIL] {label}: 期望 {want} 实得 {got}")
+            ok = False
+        else:
+            print(f"    [OK]   {label} -> {got}")
+
+    # 模板本身必须是「无效配置」，否则首次运行会被空模板顶掉界面配置
+    if parse_config_file(template)[2]:
+        print("    [FAIL] 模板会被判定为有效配置，应返回 False")
+        ok = False
+    else:
+        print("    [OK]   空模板不会顶掉已保存的配置")
+
+    return ok
+
+
 def check_json() -> bool:
     ok = True
     print("  [OpenAI 兼容格式]")
@@ -943,6 +1016,7 @@ if __name__ == "__main__":
     b = check_config()
     b = check_profiles() and b
     b = check_models() and b
+    b = check_configfile() and b
     b = check_json() and b
     print("4) 对照 PotPlayer 官方 API 文档 (api.txt)")
     c = check_api()

@@ -310,6 +310,34 @@ add=inception; preset=inception
 插件检测到「无报错 + 无内容 + usage 里有 reasoning_tokens」时会直接把修复方法打出来。
 
 
+### 文本配置通道（v0.9）—— 不用去找界面里的隐藏入口
+
+PotPlayer 的账户输入口很隐蔽（要点击列表里「账户」列那个小格子才会弹出对话框），
+所以 v0.9 又开了一条**纯文本通道**：
+
+```
+C:\Users\<你>\AppData\Roaming\PotPlayerMini64\deepseek_api.txt
+```
+
+（确切路径每次启动都会打印在日志里；文件不存在时插件会**自动生成一份带注释的模板**。）
+
+内容只有两行有意义：
+
+```
+account=add=inception; preset=inception
+key=sk-你的key
+```
+
+- `account` 的写法与界面「账户名称」**完全一致**，所以 `add=` / `use=` / `del=` / `list` / `models` 全都可用
+- **文件存在且填了内容时优先于界面配置**；删掉文件即可回到界面配置
+- 空模板（只有注释、值为空）不会被判定为有效配置，不会顶掉你界面里存的东西
+- 兼容 UTF-8 BOM、LF/CRLF、`#` 与 `;` 注释、键名大小写与 `apikey`/`api_key` 别名
+
+底层依据是 `api.txt` 第 126 行：`HostFileOpen` 的「Open local file for read」**没有路径限制**
+（只有 `HostFileCreate` 被限死在配置目录），所以读任意路径可行，
+而写模板正好就该放在配置目录里。
+
+
 ### 配置项语法（`add=` 之后、或一次性配置时使用）
 
 分号 `;` 分隔，每项 `键=值`；也可以**直接填一个裸 URL**（等价于 `url=...`）。

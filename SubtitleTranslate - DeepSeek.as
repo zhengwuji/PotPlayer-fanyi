@@ -50,7 +50,7 @@ string GetTitle() {
 }
 
 string GetVersion() {
-    return "0.8";
+    return "0.9";
 }
 
 string GetDesc() {
@@ -162,6 +162,108 @@ void SaveModelList() {
 
 // 只认 1..999。AngelScript 没有文档化的 atoi，但 int→string 有 formatInt，
 // 用它逐个比对即可，不依赖任何未文档化的东西。
+// ============================ 文本配置通道（绕开界面，记事本改一行即可）
+// PotPlayer 的账户输入入口很隐蔽（要click列表里「账户」列的那种小格子），
+// 所以这里再给一条纯文本通道：配置文件放在配置目录，存在且有效时优先。
+//   api.txt 第126行 HostFileOpen「Open local file for read」没有路径限制，
+//   而 HostFileCreate 被限死在 config 目录，所以放这里最合适。
+string CFG_FILE = "deepseek_api.txt";
+string fileAcct = "";
+string fileKey  = "";
+bool   fileConfigActive = false;
+
+string ConfigFilePath() {
+    string p = HostGetConfigFolder();
+    if (p.empty()) return "";
+    if (p.Right(1) != "\\" && p.Right(1) != "/") p += "\\";
+    return p + CFG_FILE;
+}
+
+bool LoadConfigFile() {
+    fileAcct = "";
+    fileKey = "";
+    fileConfigActive = false;
+
+    string path = ConfigFilePath();
+    if (path.empty()) return false;
+    if (!HostFileExist(path)) {
+        WriteConfigTemplate(path);
+        return false;
+    }
+
+    uintptr fp = HostFileOpen(path);
+    if (fp == 0) {
+        Dbg("config file exists but could not be opened");
+        return false;
+    }
+
+    int64 len64 = HostFileLength(fp);
+    int len = int(len64);
+    if (len <= 0 || len > 65536) {
+        HostFileClose(fp);
+        return false;
+    }
+
+    string txt = HostFileRead(fp, len);
+    HostFileClose(fp);
+    if (txt.empty()) return false;
+
+    // 记事本可能存成带 BOM 的 UTF-8，BOM 会粘在第一行的键名上
+    txt.replace("\uFEFF", "");
+
+    array<string> lines = txt.split("\n");
+    int i = 0;
+    int n = int(lines.length());
+    while (i < n) {
+        string line = lines[i].Trim();
+        i++;
+        if (line.empty()) continue;
+        string first = line.Left(1);
+        if (first == "#" || first == ";") continue;   // 注释
+
+        int eq = line.find("=");
+        if (eq == -1) continue;
+
+        string k = line.Left(eq).Trim().MakeLower();
+        string v = line.Right(int(line.length()) - eq - 1).Trim();
+
+        if (k == "account" || k == "user") fileAcct = v;
+        else if (k == "key" || k == "apikey" || k == "api_key") fileKey = v;
+    }
+
+    fileConfigActive = (!fileAcct.empty() || !fileKey.empty());
+    if (fileConfigActive) {
+        Dbg("config file: account='" + fileAcct
+            + "', keyLen=" + formatInt(int(fileKey.length())));
+    }
+    return fileConfigActive;
+}
+
+// 首次运行放一份带说明的模板，省得用户猜键名
+void WriteConfigTemplate(const string &in path) {
+    uintptr fp = HostFileCreate(CFG_FILE);
+    if (fp == 0) return;
+    string t = "# PotPlayer DeepSeek Translate - 文本配置\r\n";
+    t += "#\r\n";
+    t += "# 这个文件只要存在且填了内容，就【优先于】界面里保存的配置。\r\n";
+    t += "# 删掉它即可回到界面配置。\r\n";
+    t += "#\r\n";
+    t += "# account : 与界面「账户名称」里填的写法完全一致\r\n";
+    t += "# key     : API Key\r\n";
+    t += "#\r\n";
+    t += "# 例子：\r\n";
+    t += "#   account=add=inception; preset=inception\r\n";
+    t += "#   key=sk-xxxxxxxx\r\n";
+    t += "#\r\n";
+    t += "# 想看该服务有哪些模型：把 account 改成 models 后重启 PotPlayer\r\n";
+    t += "\r\n";
+    t += "account=\r\n";
+    t += "key=\r\n";
+    HostFileWrite(fp, t);
+    HostFileClose(fp);
+    Dbg("config template created: " + path);
+}
+
 int ParseSmallInt(const string &in s) {
     string t = s.Trim();
     if (t.empty()) return -1;
@@ -1142,6 +1244,23 @@ void OnInitialize() {
 
     api_key  = HostLoadString("api_key", "");
     acctSpec = HostLoadString("account_spec", "");
+
+    // 文本配置通道优先：所见即所跑，不必去界面里找那个隐蔽的账户入口
+    HostPrintUTF8("{$CP0=config file: $}" + ConfigFilePath() + "\n");
+    if (LoadConfigFile()) {
+        string fa = fileAcct.Trim();
+        string fl = fa.MakeLower();
+        if (fl == "models" || fl == "list" || fl == "help" || fa.empty()) {
+            // 这些是界面指令，启动阶段不执行，退回已保存的配置
+            HostPrintUTF8("config file: '" + fa + "' is a UI command, using saved settings\n");
+        } else {
+            acctSpec = fa;
+            if (!fileKey.empty()) api_key = fileKey;
+            HostPrintUTF8("{$CP0=config source: $}" + CFG_FILE + "\n");
+        }
+    } else {
+        Dbg("config source: saved settings");
+    }
 
     // 初始化阶段不弹窗，避免每次启动都跳消息框
     HandleAccountSpec(acctSpec, api_key, false);

@@ -114,6 +114,8 @@ def main():
          f"url={BASE}; model={MODEL}; maxtok=512; body=\"reasoning_effort\":\"none\""),
         ("C 关闭推理（max_tokens=1024）",
          f"url={BASE}; model={MODEL}; maxtok=1024; body=\"reasoning_effort\":\"none\""),
+        # 这一条最重要：它就是配置文件里 account=add=inception; preset=inception 实际生效的东西
+        ("D preset=inception（最终推荐配置，零手写参数）", "preset=inception"),
     ]
 
     results = {}
