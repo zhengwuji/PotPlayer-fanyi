@@ -1,6 +1,7 @@
 import os
 import sys
 import ctypes
+import shutil
 import requests
 import locale
 import win32com.client
@@ -117,6 +118,67 @@ def download_file(url, dest_path, strings, max_retries=3):
                 sys.exit(1)
 
 
+# ---------------------------------------------------------------------------
+# 下载源策略：官方 raw 直链优先，其次公共 CDN / 反代镜像
+# 原版硬编码了单一第三方镜像 github.20246688.xyz，且用的是 /blob/ 页面地址
+# （返回 HTML 而非文件本体），此处一并修正为 raw 直链 + 多重回退 + 内容校验。
+# ---------------------------------------------------------------------------
+ASSET_BASES = [
+    "https://raw.githubusercontent.com/Liu8Can/PotPlayer_DeepSeek_Translate/main/",
+    "https://cdn.jsdelivr.net/gh/Liu8Can/PotPlayer_DeepSeek_Translate@main/",
+    "https://gh-proxy.com/https://raw.githubusercontent.com/Liu8Can/PotPlayer_DeepSeek_Translate/main/",
+    "https://ghfast.top/https://raw.githubusercontent.com/Liu8Can/PotPlayer_DeepSeek_Translate/main/",
+]
+
+
+def validate_as(path):
+    """确保拿到的是脚本文本，而不是反代返回的 HTML 错误页。"""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            head = f.read(8192)
+    except Exception:
+        return False
+    if len(head) < 200:
+        return False
+    if head.lstrip().startswith("<"):
+        return False
+    return ("GetTitle" in head) and ("Translate" in head)
+
+
+def validate_ico(path):
+    """ICO 文件头 00 00 01 00。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(4)
+    except Exception:
+        return False
+    return head == b"\x00\x00\x01\x00"
+
+
+def install_asset(filename, validator, strings, target_dir):
+    """先尝试安装器同目录的本地文件（离线安装），再依次尝试各下载源。"""
+    dest = os.path.join(target_dir, filename)
+
+    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    if os.path.exists(local) and validator(local):
+        shutil.copyfile(local, dest)
+        print(f"Local copy used: {local} -> {dest}")
+        return True
+
+    for base in ASSET_BASES:
+        url = base + filename.replace(" ", "%20")
+        print(f"Downloading {filename} from {base} ...")
+        try:
+            download_file(url, dest, strings, max_retries=1)
+        except SystemExit:
+            continue
+        if validator(dest):
+            return True
+        print(f"Rejected invalid payload from {base}")
+
+    return False
+
+
 # 扫描硬盘函数
 def scan_drives(strings):
     drives = [f"{chr(x)}:\\" for x in range(65, 91) if os.path.exists(f"{chr(x)}:\\")]
@@ -213,18 +275,15 @@ def install(strings):
             print(strings["failed_to_create_directory"].format(target_path))
             sys.exit(1)
 
-    # 下载文件
-    as_file_url = "https://github.20246688.xyz/https://github.com/Liu8Can/PotPlayer_DeepSeek_Translate/blob/main/SubtitleTranslate%20-%20DeepSeek.as"
-    ico_file_url = "https://github.20246688.xyz/https://github.com/Liu8Can/PotPlayer_DeepSeek_Translate/blob/main/SubtitleTranslate%20-%20DeepSeek.ico"
+    # 安装插件文件（本地优先，其次官方源与镜像，逐级回退并校验内容）
+    ok_as = install_asset("SubtitleTranslate - DeepSeek.as", validate_as, strings, target_path)
+    ok_ico = install_asset("SubtitleTranslate - DeepSeek.ico", validate_ico, strings, target_path)
 
-    as_file_path = os.path.join(target_path, "SubtitleTranslate - DeepSeek.as")
-    ico_file_path = os.path.join(target_path, "SubtitleTranslate - DeepSeek.ico")
-
-    print("Downloading SubtitleTranslate - DeepSeek.as...")
-    download_file(as_file_url, as_file_path, strings)
-
-    print("Downloading SubtitleTranslate - DeepSeek.ico...")
-    download_file(ico_file_url, ico_file_path, strings)
+    if not (ok_as and ok_ico):
+        print("ERROR: could not obtain a valid copy of the plugin files.")
+        print("Put 'SubtitleTranslate - DeepSeek.as' and 'SubtitleTranslate - DeepSeek.ico'")
+        print("next to this installer and run it again for a fully offline install.")
+        sys.exit(1)
 
     print(strings["installation_complete"].format(target_path))
 
