@@ -212,7 +212,7 @@ requirements-build.txt       构建期依赖
 ```powershell
 python -m pip install -r requirements.txt -r requirements-build.txt
 python -m PyInstaller installer.spec --noconfirm --clean
-# 产物: dist\PotPlayer-DeepSeek-Translate-Installer.exe  (约 15 MB)
+# 产物: dist\PotPlayer-DeepSeek-Translate-Installer.exe  (约 18 MB)
 ```
 
 ### 冻结模式下的三个必要修正
