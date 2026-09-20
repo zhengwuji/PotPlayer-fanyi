@@ -17,7 +17,10 @@ api_manager.py — PotPlayer DeepSeek Translate 的配套 API 管理器（图形
 
 import json
 import os
+import re
+import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 
@@ -244,15 +247,15 @@ def fetch_models(api, timeout=25):
     _, murl = resolve_urls(api.get("url", ""), api.get("format", "openai"))
     if not murl:
         return [], "请先填写 API 地址"
-    req = urllib.request.Request(murl, headers=build_headers(api), method="GET")
+    st, txt = _http("GET", murl, build_headers(api), timeout=timeout)
+    if st == 0:
+        return [], txt
+    if st != 200:
+        return [], f"HTTP {st}: {txt[:200]}"
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")[:200]
-        return [], f"HTTP {e.code}: {body}"
-    except Exception as exc:  # noqa: BLE001
-        return [], f"{type(exc).__name__}: {exc}"
+        data = json.loads(txt)
+    except ValueError:
+        return [], "响应不是合法 JSON"
 
     arr = data.get("data")
     if not isinstance(arr, list):
@@ -314,37 +317,323 @@ def murl_of(api):
     return resolve_urls(api.get("url", ""), api.get("format", "openai"))[1] or "(地址为空)"
 
 
+# ============================================ 自动适配（协议 / Key / 模型）
+def split_host_port(url):
+    """从 http(s)://host:port/... 里取出 host 与 port"""
+    u = (url or "").strip()
+    if "//" in u:
+        u = u.split("//", 1)[1]
+    u = u.split("/", 1)[0]
+    if u.startswith("["):                      # IPv6
+        host = u[:u.find("]") + 1]
+        rest = u[u.find("]") + 1:]
+        port = int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else None
+    elif ":" in u:
+        host, p = u.rsplit(":", 1)
+        port = int(p) if p.isdigit() else None
+    else:
+        host, port = u, None
+    if port is None:
+        port = 443 if (url or "").strip().lower().startswith("https") else 80
+    return host, port
+
+
+def is_local_host(host):
+    h = (host or "").lower().strip("[]")
+    if h in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return True
+    return h.startswith(("127.", "10.", "192.168.", "172.16.", "172.17.",
+                         "172.18.", "172.19.", "172.2", "172.30.", "172.31."))
+
+
+def pid_on_port(port):
+    """谁在监听这个端口（Windows: netstat -ano）"""
+    try:
+        out = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout
+    except Exception:  # noqa: BLE001
+        return 0
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 5 or not parts[1].endswith(":" + str(port)):
+            continue
+        if "LISTEN" in parts[3].upper() and parts[4].isdigit():
+            return int(parts[4])
+    return 0
+
+
+def process_path(pid):
+    """取进程可执行文件路径（纯 ctypes，不依赖 psutil）"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.OpenProcess.restype = wintypes.HANDLE
+        h = k32.OpenProcess(0x1000, False, pid)      # QUERY_LIMITED_INFORMATION
+        if not h:
+            return ""
+        try:
+            buf = ctypes.create_unicode_buffer(32768)
+            size = wintypes.DWORD(len(buf))
+            if k32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return buf.value
+        finally:
+            k32.CloseHandle(h)
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+KEY_RE = re.compile(
+    r"""(?ix) ["']?(api[_-]?key|key|token)["']?\s*[=:]\s*["']?([A-Za-z0-9_\-\.]{8,})["']?""")
+
+CONFIG_NAMES = ("config.yaml", "config.yml", "config.json", "settings.json",
+                "config.toml", "keys.json", "api_keys.json")
+
+
+def keys_in_file(path):
+    """从配置文件里抠出所有像 Key 的字符串，保持出现顺序"""
+    try:
+        raw = open(path, "r", encoding="utf-8", errors="ignore").read()
+    except OSError:
+        return []
+    out = []
+    for m in KEY_RE.finditer(raw):
+        v = m.group(2)
+        if v and v not in out:
+            out.append(v)
+    return out
+
+
+def discover_local_keys(url, log):
+    """本地地址且 Key 不认时，去监听该端口那个程序的目录里找可用 Key。
+
+    这正是「把上游账号 Key 自动换成客户端 Key」要用的机制：
+    网关的 config.yaml 里同时有 api_keys[].key（客户端）和
+    accounts[].api_key（上游），把候选全捞出来逐个实测，能通的自然是对的。
+    """
+    host, port = split_host_port(url)
+    if not is_local_host(host):
+        return []
+    pid = pid_on_port(port)
+    log.append(f"  监听 {port} 端口的进程 PID: {pid or '未找到'}")
+    if not pid:
+        return []
+    exe = process_path(pid)
+    log.append(f"  进程路径: {exe or '未知'}")
+    if not exe:
+        return []
+    d = os.path.dirname(exe)
+
+    files = [os.path.join(d, n) for n in CONFIG_NAMES
+             if os.path.isfile(os.path.join(d, n))]
+    if not files:
+        try:
+            files = [os.path.join(d, f) for f in sorted(os.listdir(d))
+                     if f.lower().endswith((".yaml", ".yml", ".json", ".toml"))]
+        except OSError:
+            files = []
+    log.append(f"  候选配置文件: {[os.path.basename(f) for f in files] or '无'}")
+
+    cands = []
+    for f in files:
+        for k in keys_in_file(f):
+            if k not in cands:
+                cands.append(k)
+    return cands
+
+
+def _http(method, url, headers, data=None, timeout=15, tries=3):
+    """发一次 HTTP，只对「连接级异常」重试。
+
+    本地中转网关偶发 RST（WinError 10054），不重试就会把
+    一次偶发网络抖动误判成「这个端点/协议不可用」。
+    返回 (status, 文本)；status=0 表示始终没连上。
+    """
+    last = ""
+    for i in range(max(1, tries)):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, r.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", errors="replace")
+        except Exception as exc:  # noqa: BLE001
+            last = f"{type(exc).__name__}: {exc}"
+            if i < tries - 1:
+                time.sleep(0.7 * (i + 1))
+    return 0, last
+
+
+def probe_models(api, key=None, timeout=10):
+    a = dict(api)
+    if key is not None:
+        a["key"] = key
+    _, murl = resolve_urls(a.get("url", ""), a.get("format", "openai"))
+    if not murl:
+        return False, "地址为空"
+    st, txt = _http("GET", murl, build_headers(a), timeout=timeout)
+    if st == 0:
+        return False, txt[:60]
+    return st == 200, f"HTTP {st}"
+
+
+def _format_verdict(api, fmt, timeout):
+    """判断某协议在这个地址上是否可用。
+
+    返回 (verdict, 说明)：True=确认支持，False=确认不支持，None=无法判断。
+
+    关键：只有 404/405 才说明「这个端点不存在」。其它任何 HTTP 状态
+    （401/403/400/422…）都证明端点存在、只是这次请求没被接受，
+    因而算「支持」。网络级错误一律算「无法判断」并重试，
+    否则一次偶发 RST 就会把正确协议误判掉。
+    """
+    a = dict(api)
+    a["format"] = fmt
+    chat, _ = resolve_urls(a.get("url", ""), fmt)
+    body = {"model": a.get("model") or "x",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 16, "temperature": 0}
+    if fmt == "anthropic":
+        body["system"] = "test"
+    st, txt = _http("POST", chat, build_headers(a),
+                     json.dumps(body).encode("utf-8"), timeout=timeout)
+    if st == 0:
+        return None, txt[:48]
+    if st in (404, 405):
+        return False, f"HTTP {st}（端点不存在）"
+    return True, f"HTTP {st}"
+
+
+def detect_format(api, timeout=25):
+    """探测该地址支持哪种协议，返回 (fmt, 说明)；判断不出返回 ('', 说明)"""
+    cur = api.get("format", "openai")
+    verdicts, notes = {}, []
+    for fmt in ("openai", "anthropic"):
+        v, note = _format_verdict(api, fmt, timeout)
+        verdicts[fmt] = v
+        notes.append(f"{fmt}:{note}")
+
+    o, an = verdicts.get("openai"), verdicts.get("anthropic")
+    if o is True and an is not True:
+        return "openai", "openai 可用，anthropic " + notes[1].split(":", 1)[1]
+    if an is True and o is not True:
+        return "anthropic", "anthropic 可用，openai " + notes[0].split(":", 1)[1]
+    if o is True and an is True:
+        keep = cur if cur in ("openai", "anthropic") else "openai"
+        return keep, f"两种都可用，保留 {keep}"
+    return "", "无法判断（" + ", ".join(notes) + "）"
+
+
+def pick_model(models, prefer=("flash", "mini", "haiku", "turbo", "free", "fast")):
+    """从模型列表里挑一个适合字幕翻译的（优先快/便宜的小模型）"""
+    low = [(m, m.lower()) for m in models]
+    for kw in prefer:
+        for m, lm in low:
+            if kw in lm:
+                return m
+    return models[0] if models else ""
+
+
+def auto_adapt(api, log=None):
+    """一键自动适配：把「不能用的配置」自动修成「能用的配置」
+
+    步骤：① 用当前 Key 试 ② 不行就找本地网关的 Key 逐个实测
+         ③ 探测协议 ④ 模型不在列表里就自动挑一个
+    """
+    log = log if log is not None else []
+    a = dict(api)
+    url = a.get("url", "")
+
+    log.append("① 用当前 Key 探测可用性")
+    ok, note = probe_models(a, timeout=8)
+    log.append(f"   结果: {note}")
+
+    if not ok:
+        log.append("② Key 不可用，尝试从本地服务自动取用")
+        cands = discover_local_keys(url, log)
+        if cands:
+            log.append(f"   找到 {len(cands)} 个候选，逐个实测：")
+            for k in cands:
+                good, n2 = probe_models(a, key=k, timeout=8)
+                log.append(f"     {k[:14]}… -> {n2}")
+                if good:
+                    a["key"] = k
+                    log.append("     ✓ 采用这个")
+                    ok = True
+                    break
+            if not ok:
+                log.append("     全部不可用")
+        else:
+            log.append("   没找到可自动取用的本地 Key（非本地地址，或没有配置文件）")
+    if not ok:
+        log.append("！Key 仍未解决，请手工确认")
+        return a, log
+
+    log.append("③ 探测协议")
+    fmt, note3 = detect_format(a)
+    log.append(f"   {note3}")
+    if fmt and fmt != a.get("format"):
+        log.append(f"   协议由 {a.get('format')} 自动改为 {fmt}")
+        a["format"] = fmt
+
+    log.append("④ 核对模型")
+    models, err = fetch_models(a)
+    if err:
+        log.append(f"   取模型列表失败（{err}），保留原模型名")
+    elif not models:
+        log.append("   列表为空，保留原模型名")
+    elif a.get("model") in models:
+        log.append(f"   原模型 {a['model']} 在列表里，保持不变")
+    else:
+        picked = pick_model(models)
+        log.append(f"   原模型 {a.get('model') or '(空)'} 不在列表（共 {len(models)} 个）")
+        log.append(f"   自动挑用: {picked}")
+        a["model"] = picked
+
+    log.append("完成：配置已可用")
+    return a, log
+
+
 def ping(api, timeout=30):
     """发一次最小翻译请求，返回 (是否成功, 说明)"""
     chat, _ = resolve_urls(api.get("url", ""), api.get("format", "openai"))
     if not chat:
         return False, "请先填写 API 地址"
-    import time
     body = {"model": api.get("model") or "x",
             "messages": [{"role": "user", "content": "hi"}],
             "max_tokens": 64, "temperature": 0}
     if api.get("no_reasoning"):
         body["reasoning_effort"] = "none"
-    req = urllib.request.Request(chat, data=json.dumps(body).encode("utf-8"),
-                                 headers=build_headers(api), method="POST")
-    t0 = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read().decode("utf-8", errors="replace"))
-    except urllib.error.HTTPError as e:
-        return False, f"HTTP {e.code}: {e.read().decode('utf-8', errors='replace')[:200]}"
-    except Exception as exc:  # noqa: BLE001
-        return False, f"{type(exc).__name__}: {exc}"
+    if api.get("body"):
+        try:
+            body.update(json.loads("{" + api["body"] + "}"))
+        except ValueError:
+            pass
 
+    t0 = time.time()
+    st, txt = _http("POST", chat, build_headers(api),
+                    json.dumps(body).encode("utf-8"), timeout=timeout)
     dt = time.time() - t0
+    if st == 0:
+        return False, txt
+    if st != 200:
+        return False, f"HTTP {st}: {txt[:200]}"
+    try:
+        data = json.loads(txt)
+    except ValueError:
+        return False, "响应不是合法 JSON"
+
     if api.get("format") == "anthropic":
         c = data.get("content")
-        txt = c[0].get("text") if isinstance(c, list) and c else None
+        out = c[0].get("text") if isinstance(c, list) and c else None
     else:
         ch = data.get("choices")
-        txt = ch[0]["message"].get("content") if isinstance(ch, list) and ch else None
-    if isinstance(txt, str) and txt.strip():
-        return True, f"成功 {dt:.1f}s，返回: {txt.strip()[:40]}"
+        out = ch[0]["message"].get("content") if isinstance(ch, list) and ch else None
+    if isinstance(out, str) and out.strip():
+        return True, f"成功 {dt:.1f}s，返回: {out.strip()[:40]}"
     reason = (data.get("usage", {}).get("completion_tokens_details", {})
                   .get("reasoning_tokens"))
     if reason:
@@ -546,11 +835,13 @@ def run_gui(auto_close_ms=None):
 
     act = ttk.Frame(right)
     act.pack(fill="x", pady=10)
-    ttk.Button(act, text="保存", command=lambda: on_save()).pack(side="left")
-    ttk.Button(act, text="设为当前并写入插件",
+    ttk.Button(act, text="① 自动适配（推荐）",
+               command=lambda: on_autoadapt()).pack(side="left")
+    ttk.Button(act, text="② 设为当前并写入插件",
                command=lambda: on_activate()).pack(side="left", padx=6)
+    ttk.Button(act, text="保存", command=lambda: on_save()).pack(side="left")
     ttk.Button(act, text="打开配置文件位置",
-               command=lambda: on_open()).pack(side="left")
+               command=lambda: on_open()).pack(side="left", padx=6)
 
     tk.Label(root, textvariable=status, anchor="w",
              relief="sunken").pack(side="bottom", fill="x")
@@ -720,6 +1011,41 @@ def run_gui(auto_close_ms=None):
         except OSError as exc:
             messagebox.showerror("打不开", str(exc))
 
+    def on_autoadapt():
+        """一键自动适配：Key / 协议 / 模型 全自动，不需要手工转换"""
+        a = form_to_api()
+        if a is None:
+            a = blank_api(f"api{len(store['apis']) + 1}")
+            store["apis"].append(a)
+            save_store(store)
+            state["index"] = len(store["apis"]) - 1
+        if not a.get("url"):
+            messagebox.showwarning("缺少地址", "至少要填 API 地址，其余交给自动适配")
+            return
+
+        status.set("正在自动适配（探测 Key / 协议 / 模型）…")
+        root.update_idletasks()
+        try:
+            fixed, log = auto_adapt(a)
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("自动适配出错", f"{type(exc).__name__}: {exc}")
+            status.set("自动适配出错")
+            return
+
+        for k in ("format", "key", "model"):
+            if fixed.get(k):
+                a[k] = fixed[k]
+        api_to_form(a)
+        save_store(store)
+        refresh(state["index"])
+        status.set("自动适配完成" + ("" if a.get("key") else "（Key 未解决）"))
+        messagebox.showinfo(
+            "自动适配结果",
+            "\n".join(log)
+            + "\n\n最终配置：\n"
+            + f"  协议: {a['format']}\n  模型: {a['model']}\n"
+            + f"  Key : {(a['key'][:16] + '…') if a.get('key') else '(空)'}")
+
     def on_models():
         a = form_to_api() or blank_api()
         if not a.get("url"):
@@ -728,9 +1054,31 @@ def run_gui(auto_close_ms=None):
         status.set("正在获取模型列表…")
         root.update_idletasks()
         models, err = fetch_models(a)
+
+        # 取不到就先自动适配一次再重试 —— 「不用我手动转换」的兜底
+        if err:
+            status.set("获取失败，先尝试自动适配…")
+            root.update_idletasks()
+            try:
+                fixed, log = auto_adapt(a)
+                for k in ("format", "key", "model"):
+                    if fixed.get(k):
+                        a[k] = fixed[k]
+                api_to_form(a)
+                save_store(store)
+                models, err = fetch_models(a)
+                if not err:
+                    status.set(f"自动适配后取到 {len(models)} 个模型")
+                    messagebox.showinfo("已自动适配后取到模型",
+                                        "\n".join(log)
+                                        + f"\n\n共 {len(models)} 个模型。")
+            except Exception:  # noqa: BLE001
+                pass
+
         if err:
             status.set("获取失败")
-            messagebox.showerror("获取可用模型失败", dialog_text(err) + f"\n\n地址：{murl_of(a)}")
+            messagebox.showerror("获取可用模型失败",
+                                 dialog_text(err) + f"\n\n地址：{murl_of(a)}")
             return
         status.set(f"取到 {len(models)} 个模型")
 
@@ -909,6 +1257,51 @@ def selftest():
     check("murl_of 正确", murl_of(a) == "https://api.inceptionlabs.ai/v1/models",
           murl_of(a))
     check("地址为空时不炸", murl_of(blank_api()) == "(地址为空)")
+
+    print("7) 自动适配的判定逻辑")
+    for url, host, port in [
+        ("http://127.0.0.1:11434/v1", "127.0.0.1", 11434),
+        ("https://api.deepseek.com/v1", "api.deepseek.com", 443),
+        ("http://localhost:3000", "localhost", 3000),
+        ("http://192.168.1.9:8080/v1", "192.168.1.9", 8080),
+    ]:
+        h, p = split_host_port(url)
+        check(f"{url} -> {h}:{p}", h == host and p == port)
+    for h, want in [("127.0.0.1", True), ("localhost", True), ("::1", True),
+                    ("192.168.1.5", True), ("10.0.0.7", True),
+                    ("api.deepseek.com", False), ("8.8.8.8", False)]:
+        check(f"is_local_host({h}) == {want}", is_local_host(h) is want)
+
+    ml = ["gpt-5.5", "deepseek/deepseek-v4-flash", "claude-opus-5"]
+    check("pick_model 优先挑 flash", pick_model(ml) == "deepseek/deepseek-v4-flash",
+          pick_model(ml))
+    check("没有关键词时退回第一个", pick_model(["aaa", "bbb"]) == "aaa")
+    check("空列表返回空串", pick_model([]) == "")
+
+    print("8) 从网关配置里抠 Key")
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "config.yaml")
+        # 注意：这里只能用同形态的假值。夹具要贴近真实配置结构，
+        # 但绝不能把真凭据写进仓库。
+        demo_client = "ccgw-" + "0" * 48
+        demo_upstream = "user_" + "A" * 90
+        with open(p, "w", encoding="utf-8") as fh:
+            fh.write("api_keys:\n"
+                     "    - name: dsh\n"
+                     "      key: ccgw-demo-client-key\n"
+                     "    - name: local\n"
+                     f"      key: {demo_client}\n"
+                     "commandcode:\n"
+                     "    accounts:\n"
+                     "        - name: main\n"
+                     f"          api_key: {demo_upstream}\n")
+        ks = keys_in_file(p)
+        check("客户端 Key 与上游 Key 都被捞出来", len(ks) == 3, str(ks))
+        check("客户端 Key 在前（config 里的书写顺序）", ks[0] == "ccgw-demo-client-key")
+        check("能识别十六进制形态的客户端 Key", demo_client in ks)
+        check("能识别 user_ 形态的上游 Key",
+              any(k.startswith("user_") for k in ks))
+        check("不存在的文件返回空", keys_in_file(os.path.join(td, "nope.yaml")) == [])
 
     print()
     print("RESULT:", "PASS" if ok else "FAIL")
