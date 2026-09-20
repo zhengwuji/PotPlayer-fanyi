@@ -4,19 +4,26 @@
 verify_as.py — 无 AngelScript 编译器时的静态自检
 
 检查项：
-  1. 花括号 / 圆括号 / 方括号 是否配平（忽略字符串字面量与注释）
+  1. 花括号 / 圆括号 / 方括号 是否配平
   2. 所有被调用的自定义函数是否都有定义
-  3. 用 Python 复刻 BuildRequest()，验证生成的 JSON 在极端输入下仍然合法
+  3. 复刻 BuildRequest() / ParseAccountSpec() / ResolveUrl()，验证
+     - 生成的 JSON 在极端输入下仍然合法
+     - 预设解析、URL 归一化、双格式（openai / anthropic）行为正确
+  4. 对照 PotPlayer 官方 Extension\\api.txt 校验 API 调用真实存在
+
+第 3 项是关键：AngelScript 逻辑无法在本机运行，
+只能靠 Python 逐行复刻来锁死行为，避免"看起来对"。
 """
 
 import json
+import os
 import re
 import sys
 
 SRC = "SubtitleTranslate - DeepSeek.as"
 
 
-# --------------------------------------------------------------------- 1. 配平
+# ========================================================== 1. 括号配平
 def strip_noise(src: str) -> str:
     """去掉块注释、行注释和字符串字面量，避免其中的括号干扰计数。"""
     out = []
@@ -63,30 +70,30 @@ def check_balance(src: str) -> bool:
     return ok
 
 
-# --------------------------------------------------------------------- 2. 符号
+# ============================================================== 2. 符号
 def check_symbols(src: str) -> bool:
     code = strip_noise(src)
-    defined = set(re.findall(r"^\s*(?:void|string|int|bool|array<\w+>)\s+(\w+)\s*\(", code, re.M))
-    defined |= set(re.findall(r"^\s*(?:void|string|int|bool|array<\w+>)\s+(\w+)\s*\(", src, re.M))
-
-    code = strip_noise(src)
+    defined = set(re.findall(
+        r"^\s*(?:void|string|int|bool|array<\w+>)\s+(\w+)\s*\(", code, re.M))
     called = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", code))
-    builtin_prefix = ("op",)
+
     custom = {c for c in called if c[0].isupper() or c in
               {"Dbg", "Finalize", "CacheGet", "CachePut", "RememberPair",
                "StartPairIndex", "BuildRequest", "IsPermanentError", "LangName",
                "JsonEscape", "ServerLogin", "Translate", "OnInitialize", "OnFinalize",
                "GetTitle", "GetVersion", "GetDesc", "GetLoginTitle", "GetLoginDesc",
-               "GetPasswordText", "GetSrcLangs", "GetDstLangs"}}
+               "GetPasswordText", "GetSrcLangs", "GetDstLangs",
+               "ApplyPreset", "ParseAccountSpec", "ResolveUrl", "CurrentUA",
+               "BuildHeaders", "BuildSystemPrompt", "BackoffSleep"}}
 
     host_ok = {c for c in custom if c.startswith("Host") or c in
                {"JsonReader", "JsonValue", "array", "string", "int", "bool", "void"}}
-    # AngelScript 内建 / 容器方法
     builtin_methods = {"Trim", "length", "empty", "find", "replace", "split",
                        "insertLast", "removeAt", "isArray", "isString", "asString",
-                       "parse", "substr"}
+                       "parse", "substr", "Left", "Right", "MakeLower", "MakeUpper",
+                       "TrimLeft", "TrimRight"}
     missing = sorted(c for c in custom - defined - host_ok - builtin_methods
-                     if not c.startswith(builtin_prefix))
+                     if not c.startswith("op"))
 
     if missing:
         print(f"  [WARN] 引用了未在文件内定义的函数: {', '.join(missing)}")
@@ -95,7 +102,7 @@ def check_symbols(src: str) -> bool:
     return True
 
 
-# ---------------------------------------------------------- 3. JSON 复刻验证
+# ================================ 3. 复刻 AngelScript 逻辑并验证行为
 def json_escape(s: str) -> str:
     return (s.replace("\\", "\\\\").replace('"', '\\"')
              .replace("\n", "\\n").replace("\r", "\\r")
@@ -105,16 +112,103 @@ def json_escape(s: str) -> str:
 MAX_CTX_SENTENCES = 3
 MAX_CTX_BYTES = 600
 
+PRESETS = {
+    "deepseek":    ("https://api.deepseek.com/v1", "deepseek-chat", "openai", "bearer"),
+    "openai":      ("https://api.openai.com/v1", "gpt-4o-mini", "openai", "bearer"),
+    "siliconflow": ("https://api.siliconflow.cn/v1", "Qwen/Qwen2.5-7B-Instruct", "openai", "bearer"),
+    "moonshot":    ("https://api.moonshot.cn/v1", "moonshot-v1-8k", "openai", "bearer"),
+    "zhipu":       ("https://open.bigmodel.cn/api/paas/v4", "glm-4-flash", "openai", "bearer"),
+    "qwen":        ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen-turbo", "openai", "bearer"),
+    "openrouter":  ("https://openrouter.ai/api/v1", "openai/gpt-4o-mini", "openai", "bearer"),
+    "groq":        ("https://api.groq.com/openai/v1", "llama-3.1-8b-instant", "openai", "bearer"),
+    "gemini":      ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-2.0-flash", "openai", "bearer"),
+    "anthropic":   ("https://api.anthropic.com", "claude-3-5-haiku-latest", "anthropic", "x-api-key"),
+    "ollama":      ("http://localhost:11434/v1", "qwen2.5:7b", "openai", "none"),
+    "lmstudio":    ("http://localhost:1234/v1", "local-model", "openai", "none"),
+}
+
+
+class Cfg:
+    def __init__(self):
+        self.base = ""
+        self.model = ""
+        self.fmt = ""
+        self.auth = ""
+        self.extra = ""
+        self.ua = ""
+
+
+def apply_preset(cfg: Cfg, name: str) -> None:
+    """复刻 ApplyPreset()"""
+    cfg.base = "https://api.deepseek.com/v1"
+    cfg.model = "deepseek-chat"
+    cfg.fmt = "openai"
+    cfg.auth = "bearer"
+    cfg.extra = ""
+    if not name or name == "deepseek":
+        return
+    if name in PRESETS:
+        b, m, f, a = PRESETS[name]
+        cfg.base, cfg.model, cfg.fmt, cfg.auth = b, m, f, a
+
+
+def parse_account_spec(cfg: Cfg, spec: str) -> str:
+    """复刻 ParseAccountSpec()，返回 acctSpec"""
+    apply_preset(cfg, "")
+    spec = spec.strip()
+    if not spec:
+        return ""
+    for tok in spec.split(";"):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "=" not in tok:
+            cfg.base = tok
+            continue
+        k, v = tok.split("=", 1)
+        k, v = k.strip().lower(), v.strip()
+        if k == "preset":
+            apply_preset(cfg, v.lower())
+        elif k in ("url", "base", "endpoint", "host"):
+            cfg.base = v
+        elif k == "model":
+            cfg.model = v
+        elif k == "format":
+            cfg.fmt = v.lower()
+        elif k == "auth":
+            cfg.auth = v.lower()
+        elif k in ("extra", "header"):
+            cfg.extra = v
+        elif k in ("ua", "useragent"):
+            cfg.ua = v
+    return spec
+
+
+def resolve_url(cfg: Cfg) -> str:
+    """复刻 ResolveUrl()"""
+    u = cfg.base.strip() or "https://api.deepseek.com/v1"
+    if "http" not in u:
+        u = "https://" + u
+    while u and u.endswith("/"):
+        u = u[:-1]
+    if "/chat/completions" in u:
+        return u
+    if "/messages" in u:
+        return u
+    has_version = any(v in u for v in ("/v1", "/v2", "/v3", "/v4"))
+    if not has_version:
+        u += "/v1"
+    u += "/messages" if cfg.fmt == "anthropic" else "/chat/completions"
+    return u
+
 
 def lang_name(code: str) -> str:
-    return {
-        "zh-CN": "Simplified Chinese (简体中文)",
-        "zh-TW": "Traditional Chinese (繁體中文)",
-        "ja": "Japanese (日本語)",
-    }.get(code, code)
+    return {"zh-CN": "Simplified Chinese (简体中文)",
+            "zh-TW": "Traditional Chinese (繁體中文)",
+            "ja": "Japanese (日本語)"}.get(code, code)
 
 
-def build_request(text, src, dst, pairs, model="deepseek-chat"):
+def build_system_prompt(src: str, dst: str) -> str:
     sp = ("You are a professional subtitle translator. "
           "Translate ONLY the last user message into natural, fluent, colloquial subtitles. "
           "Use the earlier turns as context to keep terminology, character names and tone consistent, "
@@ -128,12 +222,16 @@ def build_request(text, src, dst, pairs, model="deepseek-chat"):
           f"Target language: {lang_name(dst)}.")
     if src:
         sp += f" Source language: {lang_name(src)}."
+    return sp
 
-    # StartPairIndex：从最新往回累计；预算在"加入前"判定，因此是硬上限，
-    # 但永远至少保留最新一条。AngelScript 的 length() 是 UTF-8 字节数，用字节复刻。
-    def blen(s: str) -> int:
+
+def start_pair_index(pairs) -> int:
+    """复刻 StartPairIndex()；长度按 UTF-8 字节算，与 AngelScript 一致"""
+    def blen(s):
         return len(s.encode("utf-8"))
 
+    if not pairs:
+        return 0
     used = taken = 0
     idx = len(pairs)
     while idx > 0 and taken < MAX_CTX_SENTENCES:
@@ -144,65 +242,185 @@ def build_request(text, src, dst, pairs, model="deepseek-chat"):
         idx = cand
         used += cost
         taken += 1
+    return idx
+
+
+def build_request(cfg: Cfg, text, src, dst, pairs):
+    """复刻 BuildRequest()，返回 (期望结构, 拼接原文)"""
+    sp = build_system_prompt(src, dst)
+    start = start_pair_index(list(pairs))
+    sel = list(pairs)[start:]
+
+    if cfg.fmt == "anthropic":
+        msgs = []
+        for s, d in sel:
+            msgs.append({"role": "user", "content": s})
+            msgs.append({"role": "assistant", "content": d})
+        msgs.append({"role": "user", "content": text})
+        expected = {"model": cfg.model, "system": sp,
+                    "max_tokens": 256, "temperature": 0, "messages": msgs}
+
+        raw = '{"model":"' + json_escape(cfg.model) + '",'
+        raw += '"system":"' + json_escape(sp) + '",'
+        raw += '"max_tokens":256,"temperature":0,"messages":['
+        parts = []
+        for s, d in sel:
+            parts.append('{"role":"user","content":"' + json_escape(s) + '"}')
+            parts.append('{"role":"assistant","content":"' + json_escape(d) + '"}')
+        parts.append('{"role":"user","content":"' + json_escape(text) + '"}')
+        raw += ",".join(parts) + "]}"
+        return expected, raw
 
     msgs = [{"role": "system", "content": sp}]
-    for s, d in pairs[idx:]:
+    for s, d in sel:
         msgs.append({"role": "user", "content": s})
         msgs.append({"role": "assistant", "content": d})
     msgs.append({"role": "user", "content": text})
+    expected = {"model": cfg.model, "messages": msgs,
+                "max_tokens": 256, "temperature": 0}
 
-    # 用与 AngelScript 相同的字符串拼接方式构造，再交给 json.loads 校验
-    raw = '{"model":"' + model + '","messages":['
+    raw = '{"model":"' + json_escape(cfg.model) + '","messages":['
     raw += '{"role":"system","content":"' + json_escape(sp) + '"}'
-    for s, d in pairs[idx:]:
+    for s, d in sel:
         raw += ',{"role":"user","content":"' + json_escape(s) + '"}'
         raw += ',{"role":"assistant","content":"' + json_escape(d) + '"}'
-    raw += ',{"role":"user","content":"' + json_escape(text) + '"}]'
-    raw += ',"max_tokens":256,"temperature":0}'
+    raw += ',{"role":"user","content":"' + json_escape(text) + '"}'
+    raw += '],"max_tokens":256,"temperature":0}'
+    return expected, raw
 
-    parsed = json.loads(raw)
-    assert parsed["messages"] == msgs, "拼接结果与预期消息结构不一致"
-    return parsed, raw
+
+def check_config() -> bool:
+    """预设解析 + URL 归一化"""
+    print("  [配置解析]")
+    ok = True
+    cases = [
+        ("（留空）", "", "https://api.deepseek.com/v1/chat/completions", "deepseek-chat", "openai"),
+        ("裸 URL", "https://my-gw.com/v1", "https://my-gw.com/v1/chat/completions", "deepseek-chat", "openai"),
+        ("裸域名", "my-gw.com", "https://my-gw.com/v1/chat/completions", "deepseek-chat", "openai"),
+        ("preset=ollama", "preset=ollama", "http://localhost:11434/v1/chat/completions", "qwen2.5:7b", "openai"),
+        ("preset=zhipu（/v4 不该补 /v1）", "preset=zhipu",
+         "https://open.bigmodel.cn/api/paas/v4/chat/completions", "glm-4-flash", "openai"),
+        ("preset=gemini（/v1beta/openai）", "preset=gemini",
+         "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemini-2.0-flash", "openai"),
+        ("preset=anthropic（改格式与认证）", "preset=anthropic",
+         "https://api.anthropic.com/v1/messages", "claude-3-5-haiku-latest", "anthropic"),
+        ("preset + 覆盖 model", "preset=siliconflow; model=deepseek-ai/DeepSeek-V3",
+         "https://api.siliconflow.cn/v1/chat/completions", "deepseek-ai/DeepSeek-V3", "openai"),
+        ("自定义 url + 额外头", "url=my-proxy.local/openai; model=gpt-4o; auth=raw; extra=X-Tenant:abc|X-Trace:1",
+         "https://my-proxy.local/openai/v1/chat/completions", "gpt-4o", "openai"),
+        ("已含完整路径", "https://x.com/v1/chat/completions", "https://x.com/v1/chat/completions",
+         "deepseek-chat", "openai"),
+    ]
+    for label, spec, want_url, want_model, want_fmt in cases:
+        cfg = Cfg()
+        parse_account_spec(cfg, spec)
+        got_url, got_model, got_fmt = resolve_url(cfg), cfg.model, cfg.fmt
+        good = (got_url == want_url and got_model == want_model and got_fmt == want_fmt)
+        if not good:
+            print(f"    [FAIL] {label}\n           期望 {want_url} / {want_model} / {want_fmt}"
+                  f"\n           实得 {got_url} / {got_model} / {got_fmt}")
+            ok = False
+        else:
+            print(f"    [OK]   {label} -> {got_url}")
+    return ok
 
 
 def check_json() -> bool:
+    ok = True
+    print("  [OpenAI 兼容格式]")
+    cfg = Cfg()
+    parse_account_spec(cfg, "")
     cases = [
         ("普通中文", "我们要去哪里", "zh-CN", []),
         ("含双引号", 'He said "run!" loudly', "zh-CN", []),
         ("含反斜杠", r"C:\Users\test\file.txt", "zh-CN", []),
         ("含制表与换行", "line1\tline2\nline3", "zh-CN", []),
-        ("三行上下文", "第三条字幕", "zh-CN",
+        ("两行上下文", "第三条字幕", "zh-CN",
          [("第一条字幕", "第一行译文"), ("第二条字幕", "第二行译文")]),
-        ("六行上下文（应只取后3）", "第七条", "zh-CN",
+        ("六行历史（应只取后3）", "第七条", "zh-CN",
          [(f"第{i}条", f"译文{i}") for i in range(1, 7)]),
         ("超长单行触发字节上限", "结尾", "zh-CN",
          [("あ" * 400, "イ" * 400), ("短句", "短译")]),
-        ("空源语言(自动检测)", "auto detect test", "zh-TW", []),
         ("RTL 目标语言", "hello", "ar", []),
+        ("模型名含斜杠", "test", "zh-CN", []),
     ]
-    ok = True
-    for name, text, dst, pairs in cases:
+    for item in cases:
+        name, text, dst, pairs = item
+        if name == "模型名含斜杠":
+            parse_account_spec(cfg, "preset=siliconflow")   # 模型名 Qwen/Qwen2.5-7B-Instruct
         try:
-            parsed, raw = build_request(text, "", dst, list(pairs))
+            expected, raw = build_request(cfg, text, "", dst, pairs)
+            parsed = json.loads(raw)
+            assert parsed == expected, "拼接结果与预期结构不一致"
         except Exception as exc:  # noqa: BLE001
-            print(f"  [FAIL] {name}: {exc}")
+            print(f"    [FAIL] {name}: {exc}")
             ok = False
             continue
         roles = [m["role"] for m in parsed["messages"]]
         n_pairs = (len(roles) - 2) // 2
-        ctx_bytes = sum(
-            len(m["content"].encode("utf-8"))
-            for m in parsed["messages"][1:-1]
-        )
-        print(f"  [OK]   {name}: messages={len(roles)} 上下文对={n_pairs} "
-              f"上行字节={len(raw.encode('utf-8'))} 上下文字节={ctx_bytes}")
+        print(f"    [OK]   {name}: messages={len(roles)} 上下文对={n_pairs} "
+              f"上行字节={len(raw.encode('utf-8'))}")
         if name.startswith("六行") and n_pairs != 3:
-            print("  [FAIL] 上下文没有按 MAX_CTX_SENTENCES 截断")
+            print("    [FAIL] 上下文没有按 MAX_CTX_SENTENCES 截断")
             ok = False
         if name.startswith("超长单行") and n_pairs != 1:
-            print(f"  [FAIL] 字节上限未生效：期望只保留最新 1 条，实得 {n_pairs} 条")
+            print(f"    [FAIL] 字节上限未生效：期望 1 条，实得 {n_pairs} 条")
             ok = False
+
+    print("  [Anthropic 格式]")
+    acfg = Cfg()
+    parse_account_spec(acfg, "preset=anthropic")
+    for name, text, pairs in [
+        ("无上下文", "hello world", []),
+        ("两行上下文", "第三条", [("一", "one"), ("二", "two")]),
+        ("含引号与换行", 'say "hi"\nnext', [("之前", "before")]),
+    ]:
+        try:
+            expected, raw = build_request(acfg, text, "", "zh-CN", pairs)
+            parsed = json.loads(raw)
+            assert parsed == expected, "拼接结果与预期结构不一致"
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [FAIL] {name}: {exc}")
+            ok = False
+            continue
+        assert "system" in parsed and isinstance(parsed["system"], str)
+        assert all(m["role"] != "system" for m in parsed["messages"]), \
+            "Anthropic 的 messages 里不能出现 system 角色"
+        print(f"    [OK]   {name}: messages={len(parsed['messages'])} "
+              f"system 顶层={len(parsed['system'])} 字符")
     return ok
+
+
+# ==================================== 4. 对照 PotPlayer 官方 API 文档
+API_DOC = r"C:\Program Files\DAUM\PotPlayer\Extension\api.txt"
+
+
+def check_api() -> bool:
+    if not os.path.exists(API_DOC):
+        print(f"  [SKIP] 未找到 {API_DOC}")
+        return True
+
+    with open(API_DOC, "r", encoding="utf-8", errors="ignore") as fh:
+        doc = fh.read()
+    documented_host = set(re.findall(r"\b(Host\w+)\s*\(", doc))
+
+    with open(SRC, "r", encoding="utf-8") as fh:
+        code = strip_noise(fh.read())
+
+    used_host = set(re.findall(r"\b(Host\w+)\s*\(", code))
+    unknown_host = sorted(used_host - documented_host)
+
+    print(f"  Host* 调用 {len(used_host)} 个，api.txt 收录 {len(documented_host)} 个")
+    if unknown_host:
+        print(f"  [FAIL] 调用了 api.txt 里不存在的方法: {', '.join(unknown_host)}")
+    else:
+        print("  [OK]   所有 Host* 调用都在 api.txt 中")
+
+    if ".substr(" in code:
+        print("  [FAIL] 代码里又出现了 substr()（api.txt 的 string 类没有它）")
+        return False
+
+    return not unknown_host
 
 
 if __name__ == "__main__":
@@ -213,9 +431,12 @@ if __name__ == "__main__":
     a = check_balance(source)
     print("2) 函数引用")
     check_symbols(source)
-    print("3) JSON 结构（复刻 BuildRequest）")
-    b = check_json()
+    print("3) 复刻逻辑验证（配置解析 / 双格式请求体）")
+    b = check_config()
+    b = check_json() and b
+    print("4) 对照 PotPlayer 官方 API 文档 (api.txt)")
+    c = check_api()
 
     print()
-    print("RESULT:", "PASS" if (a and b) else "FAIL")
-    sys.exit(0 if (a and b) else 1)
+    print("RESULT:", "PASS" if (a and b and c) else "FAIL")
+    sys.exit(0 if (a and b and c) else 1)

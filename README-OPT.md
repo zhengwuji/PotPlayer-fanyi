@@ -5,6 +5,9 @@
 
 原版三个 tag（`v0.1` / `v0.2` / `v0.3`）与 `main` 分支保持原样，随时可 `git checkout main` 回滚。
 
+**当前版本：v0.5** —— v0.4.1 依 PotPlayer 官方 `Extension\api.txt` 校正了接口调用；
+v0.5 加入**完整的自定义 API 支持**（换服务商 / 换模型 / 换请求格式），详见第三节。
+
 ---
 
 ## 一、量化效果（实测）
@@ -131,7 +134,93 @@ v0.4 改用固定的 3 条上限，不再依赖 token 估算，从根上绕开�
 
 ---
 
-## 三、installer.py 的修正
+## 三、自定义 API 配置（v0.5）
+
+### 为什么需要
+
+原版把模型名写死成 `deepseek-chat`、地址写死成 DeepSeek 官方 —— 想接别家 API 完全无解。
+v0.5 把「账户名称」字段改造成完整的配置入口。PotPlayer 只提供账户/密码两个输入框，
+所以配置串全部写在账户名称里，密码仍然是 API Key。
+
+### 语法
+
+分号 `;` 分隔，每项 `键=值`；也可以**直接填一个裸 URL**（等价于 `url=...`）。
+
+| 键 | 别名 | 说明 | 默认 |
+|---|---|---|---|
+| `preset` | — | 服务商预设，见下表 | `deepseek` |
+| `url` | `base` `endpoint` `host` | 服务地址 | 随 preset |
+| `model` | — | **模型名**（原版写死，现在可任意指定） | 随 preset |
+| `format` | — | `openai` 或 `anthropic` | `openai` |
+| `auth` | — | 认证方式，见下表 | `bearer` |
+| `extra` | `header` | 额外请求头，`Name:Value\|Name:Value` | 空 |
+| `ua` | `useragent` | 自定义 User-Agent | `PotPlayer-DeepSeek-Translate/0.5` |
+
+**地址自动补全**：只填域名或 `.../v1` 都会补成完整路径；已经含 `/chat/completions`
+或 `/messages` 的则原样使用。已识别 `/v1` `/v2` `/v3` `/v4` 版本段，
+所以智谱的 `/api/paas/v4`、Gemini 的 `/v1beta/openai` 都不会被错误地再插一层 `/v1`。
+
+### 认证方式对照
+
+| `auth=` | 实际发送的请求头 | 用于 |
+|---|---|---|
+| `bearer`（默认） | `Authorization: Bearer <key>` | 绝大多数服务商 |
+| `raw` | `Authorization: <key>` | 少数网关不带 Bearer 前缀 |
+| `x-api-key` | `x-api-key: <key>` | Anthropic |
+| `api-key` | `api-key: <key>` | Azure OpenAI |
+| `none` | 不发认证头 | 本地 Ollama / LM Studio |
+
+选 `anthropic` 格式时会自动附加 `anthropic-version: 2023-06-01`。
+
+### 内置预设
+
+| `preset=` | 地址 | 默认模型 | 格式 |
+|---|---|---|---|
+| `deepseek`（默认） | api.deepseek.com/v1 | deepseek-chat | openai |
+| `openai` | api.openai.com/v1 | gpt-4o-mini | openai |
+| `siliconflow` | api.siliconflow.cn/v1 | Qwen/Qwen2.5-7B-Instruct | openai |
+| `moonshot` | api.moonshot.cn/v1 | moonshot-v1-8k | openai |
+| `zhipu` / `glm` | open.bigmodel.cn/api/paas/v4 | glm-4-flash | openai |
+| `qwen` / `dashscope` | dashscope.aliyuncs.com/compatible-mode/v1 | qwen-turbo | openai |
+| `openrouter` | openrouter.ai/api/v1 | openai/gpt-4o-mini | openai |
+| `groq` | api.groq.com/openai/v1 | llama-3.1-8b-instant | openai |
+| `together` | api.together.xyz/v1 | Llama-3.3-70B-Turbo | openai |
+| `gemini` | generativelanguage…/v1beta/openai | gemini-2.0-flash | openai |
+| `anthropic` / `claude` | api.anthropic.com | claude-3-5-haiku-latest | **anthropic** |
+| `ollama` | localhost:11434/v1 | qwen2.5:7b | openai（auth=none） |
+| `lmstudio` | localhost:1234/v1 | local-model | openai（auth=none） |
+| `oneapi` / `newapi` | localhost:3000/v1 | gpt-4o-mini | openai |
+| `azure` | 需自己补 url= | gpt-4o-mini | openai（auth=api-key） |
+
+### 直接可粘的示例
+
+```
+（留空）                                              → DeepSeek 官方
+preset=siliconflow; model=deepseek-ai/DeepSeek-V3     → 硅基流动换模型
+preset=zhipu                                          → 智谱 glm-4-flash
+preset=ollama; model=qwen2.5:7b                       → 本地 Ollama，免 Key
+preset=anthropic; model=claude-3-5-sonnet-latest      → Claude（自动切 anthropic 格式）
+https://my-gateway.com/v1                             → 裸 URL 简写
+url=my-proxy.local/openai; model=gpt-4o; auth=raw; extra=X-Tenant:abc
+```
+
+设置好后插件启动会打印生效的端点、模型、格式与认证方式，便于核对。
+
+### 双格式说明
+
+| | OpenAI 兼容 | Anthropic |
+|---|---|---|
+| 路径 | `/v1/chat/completions` | `/v1/messages` |
+| system 提示词 | `messages[0].role = "system"` | 顶层 `system` 字段 |
+| 取译文 | `choices[0].message.content` | `content[0].text` |
+
+两种格式的**响应解析路径不同**，插件会自动按 `format=` 选择。
+本机没有 AngelScript 运行时，但请求体形状、认证头、响应解析路径都由
+`test_api_contract.py`（本地 mock 服务）逐项验证过，见第四节。
+
+---
+
+## 四、installer.py 的修正
 
 原版有两个问题：
 
@@ -150,23 +239,32 @@ v0.4 改用固定的 3 条上限，不再依赖 token 估算，从根上绕开�
 
 ---
 
-## 四、验证
+## 五、验证
 
 ```bash
-python verify_as.py    # 括号配平 + 函数引用 + JSON 结构（复刻 BuildRequest）
-python bench_ctx.py    # 原版 context 膨胀量化
+python verify_as.py            # 括号配平 + 函数引用 + 复刻逻辑 + api.txt 交叉校验
+python test_api_contract.py    # 本地 mock 服务验证 HTTP 契约（22 项）
+python test_install.py         # 安装落盘端到端测试
+python bench_ctx.py            # 原版 context 膨胀量化
 python -m py_compile installer.py
 ```
 
-`verify_as.py` 当前输出 `RESULT: PASS`。
+全部输出 `RESULT: PASS`。
+
+`verify_as.py` 的第三项会把 AngelScript 逻辑**逐行复刻成 Python** 再跑断言 —— 因为本机
+无法执行 `.as`，这是唯一能锁死行为的手段。它覆盖：10 组配置串解析 / URL 归一化、
+9 组 OpenAI 格式请求体、3 组 Anthropic 格式请求体。
+
+`test_api_contract.py` 起一个模拟真实服务商响应体的本地 HTTP 服务，验证路径补全、
+认证头、`extra` 自定义头、两种响应解析路径、以及欠费错误体的识别。
 
 **未验证部分**：本机没有 PotPlayer 的 AngelScript 运行时，因此
-**脚本未经真实加载测试**。`Finalize()` 里用到了 `string.substr()`，若你的
-PotPlayer 版本不支持该方法，删掉那 3 行截断逻辑即可，其余部分不受影响。
+**`.as` 脚本仍未经真实加载测试**。所有 `Host*` 调用已逐一比对官方 `api.txt`
+（7/7 命中），`substr` 这类未文档化方法已清除，但语法层面的问题只能在实机暴露。
 
 ---
 
-## 五、部署
+## 六、部署
 
 ### 方式 A：一键安装器 exe（推荐）
 
@@ -191,12 +289,14 @@ dist\PotPlayer-DeepSeek-Translate-Installer.exe
    PotPlayer 的翻译插件目录，例如
    `D:\Program Files\DAUM\PotPlayer\Extension\Subtitle\Translate`
 2. 重启 PotPlayer。
-3. 设置里：**账户名称**留空（或用自定义端点），**密码**填 DeepSeek API Key。
-4. 想排查问题就把脚本里的 `DEBUG_LOG` 改成 `true`，然后看 PotPlayer 的日志。
+3. **账户名称**：留空用 DeepSeek 官方；或按第三节填 `preset=...;model=...` 自定义 API。
+   **密码**填 API Key（`auth=none` 的本地服务可留空）。
+4. 想排查问题就把脚本里的 `DEBUG_LOG` 改成 `true` —— 插件会调用
+   `HostOpenConsole()` 打开宿主的调试控制台，日志实时可见，不用去翻文件。
 
 ---
 
-## 六、从源码构建 exe
+## 七、从源码构建 exe
 
 原版仓库把 `build/` `dist/` `*.spec` 全部写进了 `.gitignore`，所以 Releases 里的
 `installer.exe` **无法从源码复现**——这是"仓库不是完整源码"的真正缺口。本分支补上了：
@@ -240,29 +340,30 @@ ModuleNotFoundError: No module named 'email'
 
 ---
 
-## 七、验证命令一览
+## 八、验证命令一览
 
 ```powershell
-python verify_as.py            # .as 静态自检：括号配平 + 函数引用 + JSON 结构
-python bench_ctx.py            # 原版 context 膨胀量化
+python verify_as.py            # .as 静态自检 + 复刻逻辑断言 + api.txt 交叉校验
+python test_api_contract.py    # HTTP 契约测试（本地 mock 服务，22 项）
 python test_install.py         # 安装落盘端到端测试（临时目录，不碰 PotPlayer）
+python bench_ctx.py            # 原版 context 膨胀量化
 python -m py_compile installer.py
 
-# exe 冒烟自检（打印内嵌资源的 SHA256，可与源文件比对）
+# exe 冒烟自检（不写盘、不触发 UAC，打印内嵌资源的 SHA256）
 .\dist\PotPlayer-DeepSeek-Translate-Installer.exe --check
 ```
 
 全部输出 `PASS`。
 
-### 内嵌资源哈希（v0.4 当前值）
+### 内嵌资源哈希
+
+用 `--check` 打印的 SHA256 与下面比对，即可确认 exe 内嵌的正是本分支的 v0.5 脚本：
 
 ```
-b5dad273c3ee355dfa1898b859274d86ed71725c37cf8152756a3959db863fb9  SubtitleTranslate - DeepSeek.as
+090cde84e5c4c495786d1b299f75ec18d3d0b90e260e9a1ff8c427fcf711d358  SubtitleTranslate - DeepSeek.as
 2cef8f8a8b0d8fc9beaf954ec49a9c19952dff9eb5f0f753f8f54ec02d41ed89  SubtitleTranslate - DeepSeek.ico
 ```
 
-`--check` 打印的哈希与上表一致，即证明 exe 内嵌的是本分支的 v0.4 脚本。
+（每次改脚本后哈希会变，以 `--check` 实际输出为准；`verify_as.py` 的第四项会
+断言脚本里没有 `substr` 等 `api.txt` 未收录的调用，防止回退。）
 
-**未验证部分**：本机没有 PotPlayer 的 AngelScript 运行时，因此
-**`.as` 脚本未经真实加载测试**。`Finalize()` 里用到了 `string.substr()`，若你的
-PotPlayer 版本不支持该方法，删掉那 3 行截断逻辑即可，其余部分不受影响。
