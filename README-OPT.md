@@ -134,15 +134,104 @@ v0.4 改用固定的 3 条上限，不再依赖 token 估算，从根上绕开�
 
 ---
 
-## 三、自定义 API 配置（v0.5）
+## 三、多 API 管理（v0.6）
 
-### 为什么需要
+### 能做什么
 
-原版把模型名写死成 `deepseek-chat`、地址写死成 DeepSeek 官方 —— 想接别家 API 完全无解。
-v0.5 把「账户名称」字段改造成完整的配置入口。PotPlayer 只提供账户/密码两个输入框，
-所以配置串全部写在账户名称里，密码仍然是 API Key。
+**保存任意多个自定义 API，随时新增、切换、删除**，不必每次重写一长串配置。
 
-### 语法
+「账户名称」输入框（v0.6 起已由新增的 `GetUserText()` 打上标签）支持这些写法：
+
+| 写法 | 作用 |
+|---|---|
+| *（留空）* | 使用 DeepSeek 官方 |
+| `work` 或 `use=work` | **切换到已保存的 API「work」** |
+| `add=work; preset=siliconflow; model=xxx` | **新增 / 覆盖保存**一个 API 并立即启用 |
+| `del=work` | 删除该 API |
+| `list` | **弹窗列出全部**已保存的 API（含地址、模型、格式、认证） |
+| `https://xxx/v1` 或 `preset=...; model=...` | 一次性配置，**不保存**（兼容 v0.5 行为） |
+
+保存的 API 各自带自己的 Key，切换时自动一并切换。名字大小写不敏感。
+
+### 现场演示
+
+新增两个：
+
+```
+第 1 次  账户名称: add=zhipu; preset=zhipu; model=glm-4-flash
+         密码栏  : sk-你的智谱key
+
+第 2 次  账户名称: add=local; preset=ollama; model=qwen2.5:7b
+         密码栏  : （留空，本地服务不需要 Key）
+```
+
+之后切换只需写名字：
+
+```
+账户名称: zhipu         ← 切到智谱
+账户名称: local         ← 切到本地 Ollama
+账户名称: list          ← 看看都存了些什么
+账户名称: del=local     ← 不要了，删掉
+```
+
+**Key 的更新**：切到某个 API 时如果在密码栏输了新 Key，会自动写回该 API（方便换 Key）。
+
+### 存储方式
+
+用 `HostSaveString("profiles", ...)` 保存 —— 与 `api_key` 完全相同的机制，
+在本项目里已经验证过可以跨会话持久化。
+
+记录之间用不可见控制字符 `\u0001` / `\u0002` 分隔。之所以不用可见字符：
+`extra=` 自定义请求头里本身就带 `:` 和 `|`，用它们会切分歧义。
+（`AngelScript` 的 `split` 是按「字符集合」切分而非按子串，所以分隔符必须是单字符。）
+
+### 顺带修掉的两个原版/前版缺陷
+
+1. **`GetUserText()` 缺失**。`GetUserText()` 是官方插件（google / DeepL / bing /
+   LM Studio / Yandex / papagoNMT / Libre）**全部实现**的入口，用来给「账户名称」
+   输入框加标签。原版和 v0.4/v0.5 都没实现，所以那个框没有任何提示 ——
+   这正是"不知道该往哪填"的原因之一。现已补上。
+2. **`ServerLogout()` 缺失**，多数官方插件都有，一并补上。
+
+### 一个编译级 bug（v0.4/v0.5 存在）
+
+`api.txt` 自带的示例写的是：
+
+```
+HostMessageBox("ThreadFunction " + formatInt(num));
+```
+
+**不是** `"ThreadFunction " + num` —— 说明 AngelScript 不会把数字隐式转成字符串。
+而 v0.4/v0.5 里有一行：
+
+```angelscript
+Dbg("attempt " + retryCount + ", model=" + cfgModel + ", body=" + body.length() + " bytes");
+```
+
+`retryCount` 是 `int`、`body.length()` 是 `uint`，**这一行会导致脚本编译失败**。
+v0.6 已全部改为 `formatInt(...)`。
+
+这个 bug 肉眼极难发现，所以我给验证脚本加了 `check_concat` 规则，
+并且做了**双向验证**（`test_concat_checker.py`）：
+
+```
+d9c4741 v0.5（已知缺陷）  expect=FAIL  got=FAIL   ← 准确报出 retryCount 与 body.length()
+worktree 当前版本         expect=PASS  got=PASS
+```
+
+只对好代码通过的检查器等于没有检查器，所以负向用例是必须的。
+
+### 关于 `substr` 的更正
+
+v0.4.1 时我依据 `api.txt` 判断 "string 类没有 `substr`"，并为此写了硬性禁用规则。
+这个判断**不准确**：官方 `google.as` 自己就用了 `substr(start, count)` 和 `findFirst`，
+说明 `api.txt` 列出的只是 PotPlayer 的**附加**方法，并非全集
+（`find` / `split` / `length` 同样不在列表里，但原版一直在用）。
+
+本脚本仍统一使用文档明确收录的 `Left()`，但禁用规则已从 "FAIL" 降为提示。
+那条依据不成立的硬规则已撤销。
+
+### 配置项语法（`add=` 之后、或一次性配置时使用）
 
 分号 `;` 分隔，每项 `键=值`；也可以**直接填一个裸 URL**（等价于 `url=...`）。
 
@@ -344,6 +433,7 @@ ModuleNotFoundError: No module named 'email'
 
 ```powershell
 python verify_as.py            # .as 静态自检 + 复刻逻辑断言 + api.txt 交叉校验
+python test_concat_checker.py  # 反向验证：对已知缺陷版本必须报 FAIL
 python test_api_contract.py    # HTTP 契约测试（本地 mock 服务，22 项）
 python test_install.py         # 安装落盘端到端测试（临时目录，不碰 PotPlayer）
 python bench_ctx.py            # 原版 context 膨胀量化
@@ -360,7 +450,7 @@ python -m py_compile installer.py
 用 `--check` 打印的 SHA256 与下面比对，即可确认 exe 内嵌的正是本分支的 v0.5 脚本：
 
 ```
-090cde84e5c4c495786d1b299f75ec18d3d0b90e260e9a1ff8c427fcf711d358  SubtitleTranslate - DeepSeek.as
+1b175900bc5bbf1c4e2f7f6968a7828f902f03910d12b83f04d35c7f21751da6  SubtitleTranslate - DeepSeek.as
 2cef8f8a8b0d8fc9beaf954ec49a9c19952dff9eb5f0f753f8f54ec02d41ed89  SubtitleTranslate - DeepSeek.ico
 ```
 

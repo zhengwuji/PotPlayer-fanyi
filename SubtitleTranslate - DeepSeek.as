@@ -1,33 +1,32 @@
 /*
-    Real-time subtitle translation for PotPlayer using DeepSeek API
+    Real-time subtitle translation for PotPlayer
+    DeepSeek / 自定义 OpenAI 兼容或 Anthropic 兼容 API
     ------------------------------------------------------------------
-    v0.4 optimized build
-      P0-1  context limited to last 3 lines / 600 bytes (was ~3000 tokens)
-      P0-2  system + alternating user/assistant turns (no context bleed),
-            max_tokens 256 (was 1000)
-      P0-3  history written only after a successful translation
-      P1-1  exponential backoff + permanent errors short-circuit
-      P1-2  warm-up request in OnInitialize (kills the garbled first lines)
-      P1-3  LRU cache + repeat-line short-circuit
-      P1-4  UTF-8 aware token estimate
-      P2-1  custom endpoint via the User field; neutral User-Agent
-      P2-2  paired RTL isolation marks (U+2067 / U+2069)
-      P2-3  punctuation rule clarified
-      P3-1  language codes mapped to human readable names
-      P3-2  output sanitised/capped, JsonEscape hardened
+    v0.4 优化
+      P0-1  context 限制为最近 3 条 / 600 字节（原为 ~3000 token）
+      P0-2  system + user/assistant 交替，根除 context 混译；max_tokens 1000→256
+      P0-3  只有翻译成功才写入历史（修原版脏 context bug）
+      P1-1  指数退避 + 永久错误短路
+      P1-2  启动预热，消除开头乱码
+      P1-3  LRU 缓存 + 重复行短路
+      P2-2  RTL 隔离符成对（U+2067/U+2069）
+      P3-2  输出压单行 + 截断，JsonEscape 补齐控制字符
 
-    v0.4.1 — 依 Extension\api.txt（PotPlayer 官方 AngelScript 接口文档）校正：
-      * string 类没有 substr()，只有 Left/Right/Trim*，改用 Left()
-      * 长等待切片 + HostIncTimeOut：api.txt 明示长等待会被判超时
-      * DEBUG_LOG 打开时调用 HostOpenConsole()，日志可直接在控制台看
+    v0.5  完整自定义 API：账户名支持 preset/url/model/format/auth/extra/ua
+          与裸 URL；15 个服务商预设；OpenAI 与 Anthropic 双格式；
+          5 种认证方式。
 
-    v0.5 — 完整的自定义 API 支持：
-      * 「账户名称」字段支持 preset= / url= / model= / format= / auth= / extra= / ua=
-        分号分隔的配置串，也兼容直接填一个裸 URL
-      * 模型名不再写死，可任意指定（原版固定 deepseek-chat）
-      * 支持 OpenAI 兼容格式与 Anthropic 格式两套请求/响应结构
-      * 支持 Bearer / x-api-key / api-key / 裸 Authorization / 无认证 五种认证
-      * 内置 15 个常用服务商预设，填 preset=xxx 即可
+    v0.6  多 API 管理（本版核心）
+      * 可保存任意多个自定义 API，随时新增/切换/删除，不再每次改写一个字段
+        账户名称:  use=名字 或直接写名字   切换
+                   add=名字; preset=...     新增/覆盖
+                   del=名字                 删除
+                   list                     弹窗列出全部
+      * 新增 GetUserText()：给「账户名称」输入框加标签（官方插件都有，原脚本缺）
+      * 新增 ServerLogout()
+      * 修 v0.4/v0.5 的编译级 bug：int 不能隐式拼进字符串，
+        必须用 formatInt()（见 api.txt 自带示例）
+      * 候选配置存于 HostSaveString("profiles")，与 api_key 同一机制，已验证可用
 */
 
 // ============================================================ Plugin info
@@ -36,19 +35,24 @@ string GetTitle() {
 }
 
 string GetVersion() {
-    return "0.5";
+    return "0.6";
 }
 
 string GetDesc() {
-    return "{$CP0=Real-time subtitle translation using DeepSeek / custom API$}";
+    return "{$CP0=Real-time subtitle translation. DeepSeek / custom API with profiles$}";
 }
 
 string GetLoginTitle() {
-    return "{$CP0=API Key Configuration$}";
+    return "{$CP0=API Configuration$}";
+}
+
+// 这一行显示在登录框的「账户名称」输入框旁边，告诉用户该填什么
+string GetUserText() {
+    return "{$CP936=API 配置（名字 / 留空=官方）:$}{$CP0=API profile: $}";
 }
 
 string GetLoginDesc() {
-    return "{$CP936=账户名称：留空=DeepSeek官方；也可填 preset=siliconflow;model=Qwen/Qwen2.5-7B-Instruct 这类配置，或直接填 https://你的地址/v1 。密码：API Key。$}";
+    return "{$CP936=切换: use=名字 (或直接写名字) ｜ 新增: add=名字; preset=siliconflow; model=xxx ｜ 删除: del=名字 ｜ 查看: list ｜ 留空 = DeepSeek 官方。密码栏填 API Key。$}";
 }
 
 string GetPasswordText() {
@@ -57,35 +61,36 @@ string GetPasswordText() {
 
 // ============================================================== Config
 string api_key = "";
-string USER_AGENT = "PotPlayer-DeepSeek-Translate/0.5";
+string USER_AGENT = "PotPlayer-DeepSeek-Translate/0.6";
 
 // 当前生效的自定义 API 配置
-string cfgBase   = "";                      // 服务地址（可与格式无关地写）
-string cfgModel  = "deepseek-chat";         // 模型名
-string cfgFormat = "openai";                // openai | anthropic
-string cfgAuth   = "bearer";                // bearer | raw | x-api-key | api-key | none
-string cfgExtra  = "";                      // 额外请求头，格式 Name:Value|Name:Value
-string cfgUA     = "";                      // 自定义 User-Agent（空则用 USER_AGENT）
+string cfgBase   = "";
+string cfgModel  = "deepseek-chat";
+string cfgFormat = "openai";
+string cfgAuth   = "bearer";
+string cfgExtra  = "";
+string cfgUA     = "";
+string specKey   = "";      // 配置串里 key= 的值（可选）
 
-string acctSpec  = "";                      // 「账户名称」原始内容，持久化用
+string acctSpec  = "";      // 「账户名称」原始内容
+int    activeProfile = -1;  // 当前使用的已保存 API 序号，-1 = 一次性配置
 
-int maxRetries = 3;          // total attempts per subtitle
-int baseRetryDelay = 1000;   // ms, doubled on every retry
+int maxRetries = 3;
+int baseRetryDelay = 1000;
 
-bool DEBUG_LOG = false;      // set to true to trace requests
+bool DEBUG_LOG = false;
 
-// Context / output budgets
-int MAX_CTX_SENTENCES = 3;   // how many previous lines to send as context
-int MAX_CTX_BYTES     = 600; // hard byte ceiling for those lines (~200 CJK chars)
-int MAX_OUTPUT_CHARS  = 200; // clamp on a runaway translation
-int CACHE_SIZE        = 32;  // LRU entries
+int MAX_CTX_SENTENCES = 3;
+int MAX_CTX_BYTES     = 600;
+int MAX_OUTPUT_CHARS  = 200;
+int CACHE_SIZE        = 32;
 
 void Dbg(const string &in m) {
     if (DEBUG_LOG) HostPrintUTF8("[DeepSeek] " + m + "\n");
 }
 
-// api.txt 第 33-44 行：等待时间过长会被宿主判定脚本超时，
-// 必须把长等待切成小片，并在循环中调用 HostIncTimeOut 延长超时预算。
+// api.txt 第 33-44 行：长等待会被判脚本超时，
+// 要把等待切片并在循环里调 HostIncTimeOut 延长预算。
 void BackoffSleep(int ms) {
     int left = ms;
     while (left > 0) {
@@ -97,10 +102,107 @@ void BackoffSleep(int ms) {
     }
 }
 
+// ====================================================== 已保存 API 的管理
+// 分隔符用不可见控制字符：extra 请求头里本身带 ':' 与 '|'，用可见字符会有歧义。
+// 全部是单字符，兼容 AngelScript 的 split（它按「字符集合」切分，不是按子串）。
+string PROF_SEP  = "\u0001";
+string FIELD_SEP = "\u0002";
+
+array<string> profName;   // 名字
+array<string> profSpec;   // 配置串（preset=...; model=... 这套）
+array<string> profKey;    // 该 API 自己的 Key
+
+void LoadProfiles() {
+    while (int(profName.length()) > 0) profName.removeAt(0);
+    while (int(profSpec.length()) > 0) profSpec.removeAt(0);
+    while (int(profKey.length()) > 0) profKey.removeAt(0);
+
+    string blob = HostLoadString("profiles", "");
+    if (blob.empty()) return;
+
+    array<string> recs = blob.split(PROF_SEP);
+    int i = 0;
+    int n = int(recs.length());
+    while (i < n) {
+        string rec = recs[i];
+        i++;
+        if (rec.empty()) continue;
+        array<string> flds = rec.split(FIELD_SEP);
+        if (int(flds.length()) < 2) continue;
+        profName.insertLast(flds[0]);
+        profSpec.insertLast(flds[1]);
+        if (int(flds.length()) > 2) profKey.insertLast(flds[2]);
+        else profKey.insertLast("");
+    }
+    Dbg("loaded profiles: " + formatInt(int(profName.length())));
+}
+
+void SaveProfiles() {
+    string blob = "";
+    int i = 0;
+    int n = int(profName.length());
+    while (i < n) {
+        if (i > 0) blob += PROF_SEP;
+        blob += profName[i] + FIELD_SEP + profSpec[i] + FIELD_SEP + profKey[i];
+        i++;
+    }
+    HostSaveString("profiles", blob);
+}
+
+int FindProfile(const string &in name) {
+    string want = name.Trim().MakeLower();
+    if (want.empty()) return -1;
+    int i = 0;
+    int n = int(profName.length());
+    while (i < n) {
+        if (profName[i].MakeLower() == want) return i;
+        i++;
+    }
+    return -1;
+}
+
+// 列出全部已保存的 API。会临时切换全局配置，所以先快照再还原。
+string snapB, snapM, snapF, snapA, snapE, snapU;
+
+void SnapshotCfg() {
+    snapB = cfgBase; snapM = cfgModel; snapF = cfgFormat;
+    snapA = cfgAuth; snapE = cfgExtra; snapU = cfgUA;
+}
+
+void RestoreCfg() {
+    cfgBase = snapB; cfgModel = snapM; cfgFormat = snapF;
+    cfgAuth = snapA; cfgExtra = snapE; cfgUA = snapU;
+}
+
+void ShowProfiles() {
+    SnapshotCfg();
+
+    string msg = "已保存的自定义 API：\n\n";
+    int n = int(profName.length());
+    if (n == 0) {
+        msg += "  （还没有保存任何 API）\n\n";
+        msg += "新增方法：把「API 配置」填成\n";
+        msg += "  add=名字; preset=siliconflow; model=xxx\n";
+    } else {
+        int i = 0;
+        while (i < n) {
+            ParseAccountSpec(profSpec[i]);
+            msg += "  " + formatInt(i + 1) + ". " + profName[i];
+            if (i == activeProfile) msg += "   <== 当前";
+            msg += "\n      模型: " + cfgModel + "\n";
+            msg += "      地址: " + ResolveUrl() + "\n";
+            msg += "      格式: " + cfgFormat + " / 认证: " + cfgAuth + "\n\n";
+            i++;
+        }
+    }
+    msg += "切换: use=名字（或直接写名字）\n删除: del=名字";
+
+    RestoreCfg();
+    HostMessageBox(msg, "DeepSeek Translate - API 列表", 2, 0);
+}
+
 // ====================================================== 自定义 API 预设
-// 只列出确定用不到的字段；配置串里的显式赋值永远覆盖预设。
 void ApplyPreset(const string &in name) {
-    // 默认 = DeepSeek 官方
     cfgBase   = "https://api.deepseek.com/v1";
     cfgModel  = "deepseek-chat";
     cfgFormat = "openai";
@@ -153,24 +255,25 @@ void ApplyPreset(const string &in name) {
         cfgBase = "http://localhost:3000/v1";
         cfgModel = "gpt-4o-mini";
     } else if (name == "azure") {
-        // 需要自己补 url= 和 api-version 查询串
         cfgBase = "https://YOUR-RESOURCE.openai.azure.com/openai/deployments/YOUR-DEPLOYMENT";
         cfgModel = "gpt-4o-mini";
         cfgAuth = "api-key";
     }
 }
 
-// 解析「账户名称」字段：
-//   preset=siliconflow; model=Qwen/Qwen2.5-7B-Instruct; auth=bearer; extra=X-Foo:bar|X-Baz:qux
-//   也可以直接写一个裸 URL：https://my-gateway.com/v1
-void ParseAccountSpec(const string &in spec) {
-    ApplyPreset("");                 // 先回到默认
-    acctSpec = spec.Trim();
-    if (acctSpec.empty()) return;
+// 解析配置串。返回「规范化」后的串（去掉 key= 与 preset 展开前的原样保留），
+// 便于存进 profile。key= 的值放进 specKey。
+string ParseAccountSpec(const string &in spec) {
+    ApplyPreset("");
+    specKey = "";
 
-    array<string> parts = acctSpec.split(";");
-    int n = int(parts.length());
+    string s = spec.Trim();
+    if (s.empty()) return "";
+
+    string norm = "";
+    array<string> parts = s.split(";");
     int i = 0;
+    int n = int(parts.length());
     while (i < n) {
         string tok = parts[i].Trim();
         i++;
@@ -178,48 +281,50 @@ void ParseAccountSpec(const string &in spec) {
 
         int eq = tok.find("=");
         if (eq == -1) {
-            cfgBase = tok;            // 裸 URL 简写
+            cfgBase = tok;
+            norm += "url=" + tok + ";";
             continue;
         }
 
-        string k = tok.Left(eq).Trim().MakeLower();
+        string k = tok.Left(eq).Trim();
+        string kl = k.MakeLower();
         string v = tok.Right(int(tok.length()) - eq - 1).Trim();
 
-        if (k == "preset") {
+        if (kl == "key") {
+            specKey = v;
+            continue;                      // key 不进 profile 串，单独存
+        }
+        if (kl == "preset") {
             ApplyPreset(v.MakeLower());
-        } else if (k == "url" || k == "base" || k == "endpoint" || k == "host") {
+        } else if (kl == "url" || kl == "base" || kl == "endpoint" || kl == "host") {
             cfgBase = v;
-        } else if (k == "model") {
+        } else if (kl == "model") {
             cfgModel = v;
-        } else if (k == "format") {
+        } else if (kl == "format") {
             cfgFormat = v.MakeLower();
-        } else if (k == "auth") {
+        } else if (kl == "auth") {
             cfgAuth = v.MakeLower();
-        } else if (k == "extra" || k == "header") {
+        } else if (kl == "extra" || kl == "header") {
             cfgExtra = v;
-        } else if (k == "ua" || k == "useragent") {
+        } else if (kl == "ua" || kl == "useragent") {
             cfgUA = v;
         } else {
             Dbg("未知配置项，已忽略: " + k);
         }
+        norm += k + "=" + v + ";";
     }
+    return norm;
 }
 
-// 把 cfgBase 补成最终请求地址。
-// 注意 zhipu 是 /api/paas/v4、gemini 是 /v1beta/openai，
-// 所以只在完全没有版本段时才补 /v1。
 string ResolveUrl() {
     string u = cfgBase.Trim();
     if (u.empty()) u = "https://api.deepseek.com/v1";
-
     if (u.find("http") == -1) u = "https://" + u;
 
-    // 去掉末尾斜杠
     while (int(u.length()) > 0 && u.Right(1) == "/") {
         u = u.Left(int(u.length()) - 1);
     }
 
-    // 已经是完整路径就直接用
     if (u.find("/chat/completions") != -1) return u;
     if (u.find("/messages") != -1) return u;
 
@@ -230,11 +335,8 @@ string ResolveUrl() {
     if (u.find("/v4") != -1) hasVersion = true;
     if (!hasVersion) u += "/v1";
 
-    if (cfgFormat == "anthropic") {
-        u += "/messages";
-    } else {
-        u += "/chat/completions";
-    }
+    if (cfgFormat == "anthropic") u += "/messages";
+    else u += "/chat/completions";
     return u;
 }
 
@@ -247,7 +349,7 @@ string BuildHeaders() {
     string h = "Content-Type: application/json";
 
     if (cfgAuth == "none") {
-        // 本地 ollama / lmstudio 之类不需要认证
+        // 本地 ollama / lmstudio 不需要认证
     } else if (cfgAuth == "x-api-key") {
         h = "x-api-key: " + api_key + "\n" + h;
     } else if (cfgAuth == "api-key") {
@@ -258,9 +360,7 @@ string BuildHeaders() {
         h = "Authorization: Bearer " + api_key + "\n" + h;
     }
 
-    if (cfgFormat == "anthropic") {
-        h += "\nanthropic-version: 2023-06-01";
-    }
+    if (cfgFormat == "anthropic") h += "\nanthropic-version: 2023-06-01";
 
     if (!cfgExtra.empty()) {
         array<string> ex = cfgExtra.split("|");
@@ -273,6 +373,167 @@ string BuildHeaders() {
         }
     }
     return h;
+}
+
+// ============================================ 处理「账户名称」字段的全部写法
+string pickKey(const string &in passKey) {
+    if (!specKey.empty()) return specKey;
+    return passKey.Trim();
+}
+
+void ActivateProfile(int idx, const string &in passKey, bool rememberKey) {
+    if (idx < 0 || idx >= int(profName.length())) return;
+    activeProfile = idx;
+    ParseAccountSpec(profSpec[idx]);
+
+    string k = passKey.Trim();
+    if (k.empty()) k = profKey[idx];
+    else if (rememberKey) {
+        profKey[idx] = k;      // 用户在密码栏输了新 Key，顺手更新该 profile
+        SaveProfiles();
+    }
+
+    api_key = k;
+    HostSaveString("api_key", api_key);
+    HostSaveString("account_spec", profName[idx]);
+}
+
+void HandleAccountSpec(const string &in spec, const string &in passKey, bool showUi) {
+    string s = spec.Trim();
+    if (s.empty()) {
+        ParseAccountSpec("");
+        activeProfile = -1;
+        api_key = pickKey(passKey);
+        HostSaveString("account_spec", "");
+        return;
+    }
+
+    string low = s.MakeLower();
+
+    if (low == "list" || low == "?" || low == "help") {
+        if (showUi) ShowProfiles();
+        return;                     // 保持当前配置不变
+    }
+
+    // ---- del=名字 ----
+    if (low.find("del=") == 0) {
+        string nm = s.Right(int(s.length()) - 4).Trim();
+        int idx = FindProfile(nm);
+        if (idx >= 0) {
+            profName.removeAt(idx);
+            profSpec.removeAt(idx);
+            profKey.removeAt(idx);
+            SaveProfiles();
+            if (activeProfile == idx) activeProfile = -1;
+            else if (activeProfile > idx) activeProfile--;
+            HostPrintUTF8("profile deleted: " + nm + "\n");
+            if (showUi) HostMessageBox("已删除: " + nm, "DeepSeek Translate", 2, 0);
+        } else if (showUi) {
+            HostMessageBox("没找到名为 " + nm + " 的 API\n\n填 list 可查看全部",
+                           "DeepSeek Translate", 2, 0);
+        }
+        return;
+    }
+
+    // ---- add=名字; 配置 ----
+    if (low.find("add=") == 0) {
+        array<string> parts = s.split(";");
+        string head = parts[0].Trim();
+        string name = head.Right(int(head.length()) - 4).Trim();
+
+        string rest = "";
+        int i = 1;
+        int n = int(parts.length());
+        while (i < n) {
+            string t = parts[i].Trim();
+            i++;
+            if (t.empty()) continue;
+            if (!rest.empty()) rest += ";";
+            rest += t;
+        }
+
+        if (name.empty()) {
+            if (showUi) HostMessageBox("add= 后面要写名字，例如：\n\nadd=work; preset=siliconflow; model=xxx",
+                                       "DeepSeek Translate", 2, 0);
+            return;
+        }
+
+        string norm = ParseAccountSpec(rest);
+        string k = pickKey(passKey);
+
+        int idx = FindProfile(name);
+        if (idx >= 0) {
+            profSpec[idx] = norm;
+            profKey[idx] = k;
+        } else {
+            profName.insertLast(name);
+            profSpec.insertLast(norm);
+            profKey.insertLast(k);
+            idx = int(profName.length()) - 1;
+        }
+        SaveProfiles();
+
+        activeProfile = idx;
+        api_key = k;
+        HostSaveString("api_key", api_key);
+        HostSaveString("account_spec", s);
+
+        HostPrintUTF8("profile saved: " + name + " -> " + ResolveUrl() + "\n");
+        if (showUi) {
+            HostMessageBox("已保存 API：" + name + "\n\n地址: " + ResolveUrl()
+                           + "\n模型: " + cfgModel + "\n格式: " + cfgFormat
+                           + " / 认证: " + cfgAuth + "\n\n以后在「API 配置」里填 "
+                           + name + " 即可切回来。",
+                           "DeepSeek Translate", 2, 0);
+        }
+        return;
+    }
+
+    // ---- use=名字 或 直接写名字 ----
+    string nm = s;
+    if (low.find("use=") == 0) nm = s.Right(int(s.length()) - 4).Trim();
+
+    int hit = FindProfile(nm);
+    if (hit >= 0) {
+        ActivateProfile(hit, passKey, true);
+        HostPrintUTF8("profile active: " + profName[hit] + " -> " + ResolveUrl() + "\n");
+        if (showUi) {
+            HostMessageBox("已切换到 API：" + profName[hit] + "\n\n地址: " + ResolveUrl()
+                           + "\n模型: " + cfgModel,
+                           "DeepSeek Translate", 2, 0);
+        }
+        return;
+    }
+
+    // ---- 没匹配到名字：当作一次性配置串（兼容 v0.5） ----
+    ParseAccountSpec(s);
+    activeProfile = -1;
+    api_key = pickKey(passKey);
+    HostSaveString("account_spec", s);
+}
+
+// ============================================================ Login / logout
+string ServerLogin(string User, string Pass) {
+    Pass = Pass.Trim();
+    LoadProfiles();
+    HandleAccountSpec(User, Pass, true);
+
+    if (api_key.empty() && cfgAuth != "none") {
+        HostPrintUTF8("{$CP0=API Key not configured.$}\n");
+        return "fail: API Key is empty";
+    }
+
+    HostSaveString("api_key", api_key);
+    HostPrintUTF8("{$CP0=Configured.$}\n");
+    HostPrintUTF8("  endpoint: " + ResolveUrl() + "\n");
+    HostPrintUTF8("  model   : " + cfgModel + "\n");
+    HostPrintUTF8("  format  : " + cfgFormat + " / auth: " + cfgAuth + "\n");
+    return "200 ok";
+}
+
+void ServerLogout() {
+    api_key = "";
+    HostPrintUTF8("{$CP0=Logged out.$}\n");
 }
 
 // ============================================================ Language table
@@ -297,7 +558,6 @@ array<string> GetDstLangs() {
     return ret;
 }
 
-// P3-1: give the model a real language name instead of a bare locale code.
 string LangName(const string &in code) {
     if (code == "zh-CN") return "Simplified Chinese (简体中文)";
     if (code == "zh-TW") return "Traditional Chinese (繁體中文)";
@@ -321,31 +581,7 @@ string LangName(const string &in code) {
     if (code == "nl") return "Dutch (Nederlands)";
     if (code == "uk") return "Ukrainian (Українська)";
     if (code == "hi") return "Hindi (हिन्दी)";
-    return code; // unmapped codes pass through unchanged
-}
-
-// ============================================================ Login / config
-string ServerLogin(string User, string Pass) {
-    Pass = Pass.Trim();
-
-    // 「账户名称」现在是完整的自定义 API 配置入口
-    ParseAccountSpec(User);
-
-    bool needKey = (cfgAuth != "none");
-    if (needKey && Pass.empty()) {
-        HostPrintUTF8("{$CP0=API Key not configured. Please enter a valid API Key.$}\n");
-        return "fail: API Key is empty";
-    }
-
-    api_key = Pass;
-    HostSaveString("api_key", api_key);
-    HostSaveString("account_spec", acctSpec);
-
-    HostPrintUTF8("{$CP0=Configured.$}\n");
-    HostPrintUTF8("  endpoint: " + ResolveUrl() + "\n");
-    HostPrintUTF8("  model   : " + cfgModel + "\n");
-    HostPrintUTF8("  format  : " + cfgFormat + " / auth: " + cfgAuth + "\n");
-    return "200 ok";
+    return code;
 }
 
 // ============================================================ String helpers
@@ -361,7 +597,6 @@ string JsonEscape(const string &in input) {
     return output;
 }
 
-// P3-2 / api.txt: string 类只有 Left/Right，没有 substr。
 string Finalize(const string &in raw, const string &in dst) {
     string t = raw;
     t.replace("\r\n", " ");
@@ -376,7 +611,7 @@ string Finalize(const string &in raw, const string &in dst) {
     }
 
     if (dst == "ar" || dst == "he" || dst == "fa" || dst == "ur") {
-        t = "\u2067" + t + "\u2069"; // RLI ... PDI, never leaks past the line
+        t = "\u2067" + t + "\u2069";
     }
     return t;
 }
@@ -417,8 +652,7 @@ void RememberPair(const string &in src, const string &in dst) {
     }
 }
 
-// 从最新一条往回累计；预算在「加入前」判定，因此是硬上限，
-// 但永远至少保留最新一条。
+// 预算在「加入前」判定，因此是硬上限；但永远至少保留最新一条。
 int StartPairIndex() {
     int n = int(pairSrc.length());
     if (n == 0) return 0;
@@ -453,7 +687,6 @@ string BuildSystemPrompt(const string &in src, const string &in dst) {
     return sp;
 }
 
-// v0.5：按 cfgFormat 生成 OpenAI 兼容或 Anthropic 格式的请求体。
 string BuildRequest(const string &in text, const string &in src, const string &in dst) {
     string sp = BuildSystemPrompt(src, dst);
 
@@ -463,7 +696,6 @@ string BuildRequest(const string &in text, const string &in src, const string &i
     int i;
 
     if (cfgFormat == "anthropic") {
-        // Anthropic: system 是顶层字段，messages 只能是 user/assistant 交替
         req = "{\"model\":\"" + JsonEscape(cfgModel) + "\",";
         req += "\"system\":\"" + JsonEscape(sp) + "\",";
         req += "\"max_tokens\":256,\"temperature\":0,\"messages\":[";
@@ -481,7 +713,6 @@ string BuildRequest(const string &in text, const string &in src, const string &i
         return req;
     }
 
-    // OpenAI 兼容：system + 交替 user/assistant
     req = "{\"model\":\"" + JsonEscape(cfgModel) + "\",\"messages\":[";
     req += "{\"role\":\"system\",\"content\":\"" + JsonEscape(sp) + "\"}";
     i = start;
@@ -508,10 +739,6 @@ bool IsPermanentError(const string &in msg) {
     return false;
 }
 
-// 同时兼容 OpenAI 的 choices[0].message.content 与 Anthropic 的 content[0].text。
-// 刻意内联而不是抽成函数：api.txt 只保证 JsonValue &out 形式的引用传参，
-// 这里直接读局部变量最稳妥。
-
 // ============================================================== Translate
 string Translate(string Text, string &in SrcLang, string &in DstLang) {
     if (api_key.empty() && cfgAuth != "none") {
@@ -524,9 +751,7 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
         return "[未选择目标语言]";
     }
 
-    if (SrcLang.empty() || SrcLang == "{$CP0=Auto Detect$}") {
-        SrcLang = "";
-    }
+    if (SrcLang.empty() || SrcLang == "{$CP0=Auto Detect$}") SrcLang = "";
 
     string ck = DstLang + "||" + SrcLang + "||" + Text;
     string cached = CacheGet(ck);
@@ -545,7 +770,9 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
     int delay = baseRetryDelay;
 
     while (retryCount < maxRetries) {
-        Dbg("attempt " + retryCount + ", model=" + cfgModel + ", body=" + body.length() + " bytes");
+        // 注意：int 必须走 formatInt，AngelScript 不会把数字隐式拼进字符串
+        Dbg("attempt " + formatInt(retryCount) + ", model=" + cfgModel
+            + ", body=" + formatInt(int(body.length())) + " bytes");
 
         HostIncTimeOut(20000);
         string response = HostUrlGetString(url, CurrentUA(), headers, body);
@@ -626,27 +853,31 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
 
 // ====================================================== Plugin initialization
 void OnInitialize() {
-    // 调试模式下打开宿主调试控制台（api.txt: Open debug console），
-    // 这样 HostPrintUTF8 的输出能实时看到，不用去翻日志文件。
     if (DEBUG_LOG) HostOpenConsole();
 
-    HostPrintUTF8("{$CP0=DeepSeek translation plugin loaded.$} (v0.5)\n");
+    HostPrintUTF8("{$CP0=DeepSeek translation plugin loaded.$} (v0.6)\n");
+
+    LoadProfiles();
 
     api_key  = HostLoadString("api_key", "");
     acctSpec = HostLoadString("account_spec", "");
-    ParseAccountSpec(acctSpec);
+
+    // 初始化阶段不弹窗，避免每次启动都跳消息框
+    HandleAccountSpec(acctSpec, api_key, false);
 
     Dbg("endpoint = " + ResolveUrl());
     Dbg("model = " + cfgModel + " / format = " + cfgFormat + " / auth = " + cfgAuth);
+    Dbg("profiles = " + formatInt(int(profName.length()))
+        + ", active = " + formatInt(activeProfile));
 
     if (api_key.empty() && cfgAuth != "none") {
         HostPrintUTF8("{$CP0=No saved API Key found. Please configure it in the settings menu.$}\n");
         return;
     }
 
-    // P1-2: 预热请求，提前完成 DNS/TCP/TLS 握手并验证 Key
     string url = ResolveUrl();
     string warmBody = BuildRequest("ping", "", "zh-CN");
+    HostIncTimeOut(20000);
     string warmResponse = HostUrlGetString(url, CurrentUA(), BuildHeaders(), warmBody);
 
     if (warmResponse.empty()) {
@@ -687,7 +918,6 @@ void OnInitialize() {
     }
 }
 
-// ======================================================= Plugin finalization
 void OnFinalize() {
     HostPrintUTF8("{$CP0=DeepSeek translation plugin unloaded.$}\n");
 }

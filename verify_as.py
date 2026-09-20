@@ -91,7 +91,10 @@ def check_symbols(src: str) -> bool:
     builtin_methods = {"Trim", "length", "empty", "find", "replace", "split",
                        "insertLast", "removeAt", "isArray", "isString", "asString",
                        "parse", "substr", "Left", "Right", "MakeLower", "MakeUpper",
-                       "TrimLeft", "TrimRight"}
+                       "TrimLeft", "TrimRight", "findFirst", "findLast", "erase",
+                       "insertAt", "size", "getKeys",
+                       # PotPlayer 内建全局函数（api.txt 自带示例里用了 formatInt）
+                       "formatInt"}
     missing = sorted(c for c in custom - defined - host_ok - builtin_methods
                      if not c.startswith("op"))
 
@@ -99,6 +102,49 @@ def check_symbols(src: str) -> bool:
         print(f"  [WARN] 引用了未在文件内定义的函数: {', '.join(missing)}")
     else:
         print("  [OK]   所有自定义函数均有定义")
+    return True
+
+
+# ---------------------------------------------- 2b. int 隐式拼串检测
+# api.txt 自己的示例是 HostMessageBox("ThreadFunction " + formatInt(num))，
+# 说明 AngelScript 不会把 int 隐式转成 string。漏用 formatInt 会直接编译失败，
+# 而肉眼看代码几乎发现不了。
+NUMERIC_NAMES = {
+    "retryCount", "delay", "maxRetries", "baseRetryDelay", "i", "j", "n", "m",
+    "idx", "taken", "used", "cost", "cand", "left", "chunk", "ms", "start",
+    "count", "rec", "len", "hit", "semi", "eq", "activeProfile", "DEBUG_LOG",
+    "CACHE_SIZE", "MAX_CTX_SENTENCES", "MAX_CTX_BYTES", "MAX_OUTPUT_CHARS",
+}
+
+
+def check_concat(src: str) -> bool:
+    code = strip_noise(src)
+    # 先把 formatInt(...) 整体抹掉（含一层嵌套），剩下的裸数字才算错
+    masked = re.sub(r"formatInt\s*\(([^()]|\([^()]*\))*\)", "FMT", code)
+
+    # 类型消歧：形参/局部变量可能同名而类型不同，
+    # 例如 Dbg(const string &in m) 的 m 是字符串，不是计数器。
+    declared_string = set(re.findall(
+        r"\bstring\s+(?:&\w+\s+)?(\w+)", code))
+
+    def numeric(name: str) -> bool:
+        return name in NUMERIC_NAMES and name not in declared_string
+
+    bad = []
+    for m in re.finditer(r"\+\s*([A-Za-z_]\w*)\s*(?=[+\),;]|$)", masked, re.M):
+        if numeric(m.group(1)):
+            bad.append(m.group(1))
+    for m in re.finditer(r"([A-Za-z_]\w*)\s*\+\s*\"", masked):
+        if numeric(m.group(1)):
+            bad.append(m.group(1))
+    for m in re.finditer(r"\+\s*[\w\[\]]+\.(?:length|size)\(\)", masked):
+        bad.append(m.group(0).strip())
+
+    bad = sorted(set(bad))
+    if bad:
+        print(f"  [FAIL] 数字被直接拼进字符串（必须包 formatInt）: {', '.join(bad)}")
+        return False
+    print("  [OK]   所有数字拼串都走了 formatInt")
     return True
 
 
@@ -325,6 +371,251 @@ def check_config() -> bool:
     return ok
 
 
+PROF_SEP = "\u0001"
+FIELD_SEP = "\u0002"
+
+
+def parse_account_spec_full(cfg: Cfg, spec: str):
+    """复刻 v0.6 的 ParseAccountSpec()，返回 (norm, spec_key)"""
+    apply_preset(cfg, "")
+    spec_key = ""
+    s = spec.strip()
+    if not s:
+        return "", ""
+    norm = ""
+    for tok in s.split(";"):
+        tok = tok.strip()
+        if not tok:
+            continue
+        if "=" not in tok:
+            cfg.base = tok
+            norm += "url=" + tok + ";"
+            continue
+        k, v = tok.split("=", 1)
+        k, kl, v = k.strip(), k.strip().lower(), v.strip()
+        if kl == "key":
+            spec_key = v
+            continue
+        if kl == "preset":
+            apply_preset(cfg, v.lower())
+        elif kl in ("url", "base", "endpoint", "host"):
+            cfg.base = v
+        elif kl == "model":
+            cfg.model = v
+        elif kl == "format":
+            cfg.fmt = v.lower()
+        elif kl == "auth":
+            cfg.auth = v.lower()
+        elif kl in ("extra", "header"):
+            cfg.extra = v
+        elif kl in ("ua", "useragent"):
+            cfg.ua = v
+        norm += k + "=" + v + ";"
+    return norm, spec_key
+
+
+class Store:
+    """复刻 .as 里的 profile 存取与 HandleAccountSpec() 分支"""
+
+    def __init__(self):
+        self.names, self.specs, self.keys = [], [], []
+        self.cfg = Cfg()
+        self.key = ""
+        self.active = -1
+        self.box = None
+
+    def blob(self):
+        return PROF_SEP.join(
+            f"{n}{FIELD_SEP}{s}{FIELD_SEP}{k}"
+            for n, s, k in zip(self.names, self.specs, self.keys))
+
+    def load(self, blob):
+        self.names, self.specs, self.keys = [], [], []
+        if not blob:
+            return
+        for rec in blob.split(PROF_SEP):
+            if not rec:
+                continue
+            f = rec.split(FIELD_SEP)
+            if len(f) < 2:
+                continue
+            self.names.append(f[0])
+            self.specs.append(f[1])
+            self.keys.append(f[2] if len(f) > 2 else "")
+
+    def find(self, name):
+        w = name.strip().lower()
+        if not w:
+            return -1
+        for i, n in enumerate(self.names):
+            if n.lower() == w:
+                return i
+        return -1
+
+    def handle(self, spec, pass_key, show_ui):
+        s = spec.strip()
+        if not s:
+            parse_account_spec_full(self.cfg, "")
+            self.active = -1
+            _, k = parse_account_spec_full(self.cfg, "")
+            self.key = k or pass_key.strip()
+            return
+        low = s.lower()
+
+        if low in ("list", "?", "help"):
+            if show_ui:
+                self.box = "list"
+            return
+
+        if low.startswith("del="):
+            nm = s[4:].strip()
+            idx = self.find(nm)
+            if idx >= 0:
+                for arr in (self.names, self.specs, self.keys):
+                    arr.pop(idx)
+                if self.active == idx:
+                    self.active = -1
+                elif self.active > idx:
+                    self.active -= 1
+                self.box = "deleted"
+            else:
+                self.box = "notfound"
+            return
+
+        if low.startswith("add="):
+            parts = s.split(";")
+            head = parts[0].strip()
+            name = head[4:].strip()
+            rest = ";".join(p.strip() for p in parts[1:] if p.strip())
+            if not name:
+                self.box = "needname"
+                return
+            norm, sk = parse_account_spec_full(self.cfg, rest)
+            k = sk or pass_key.strip()
+            idx = self.find(name)
+            if idx >= 0:
+                self.specs[idx] = norm
+                self.keys[idx] = k
+            else:
+                self.names.append(name)
+                self.specs.append(norm)
+                self.keys.append(k)
+                idx = len(self.names) - 1
+            self.active = idx
+            self.key = k
+            self.box = "saved"
+            return
+
+        nm = s
+        if low.startswith("use="):
+            nm = s[4:].strip()
+        hit = self.find(nm)
+        if hit >= 0:
+            self.active = hit
+            parse_account_spec_full(self.cfg, self.specs[hit])
+            k = pass_key.strip()
+            if k:
+                self.keys[hit] = k
+            else:
+                k = self.keys[hit]
+            self.key = k
+            self.box = "active"
+            return
+
+        _, sk = parse_account_spec_full(self.cfg, s)
+        self.active = -1
+        self.key = sk or pass_key.strip()
+
+
+def check_profiles() -> bool:
+    print("  [多 API 管理]")
+    ok = True
+    st = Store()
+
+    # 1. 新增两个 API
+    st.handle("add=zhipu; preset=zhipu; model=glm-4-flash", "sk-zhipu-1", True)
+    if st.box != "saved" or st.names != ["zhipu"] or st.key != "sk-zhipu-1":
+        print(f"    [FAIL] 第一个 API 保存失败: names={st.names} key={st.key}")
+        ok = False
+    else:
+        print(f"    [OK]   add=zhipu -> 已保存，模型 {st.cfg.model}")
+
+    st.handle("add=local; preset=ollama", "", True)
+    if st.names != ["zhipu", "local"] or st.key != "":
+        print(f"    [FAIL] 第二个 API 保存失败: names={st.names} key={st.key}")
+        ok = False
+    else:
+        print(f"    [OK]   add=local -> 已保存，auth={st.cfg.auth}（本地服务免 Key）")
+
+    # 2. 落盘/读回（往返一致性，这是 HostSaveString 的实际行为）
+    blob = st.blob()
+    st2 = Store()
+    st2.load(blob)
+    if st2.names != st.names or st2.specs != st.specs or st2.keys != st.keys:
+        print("    [FAIL] 序列化往返不一致")
+        ok = False
+    else:
+        print(f"    [OK]   序列化往返一致（{len(blob)} 字符，含不可见分隔符）")
+
+    # 3. 切换：只写名字
+    st.handle("local", "", True)
+    if st.active != 1 or st.cfg.auth != "none":
+        print(f"    [FAIL] 直接写名字切换失败: active={st.active} auth={st.cfg.auth}")
+        ok = False
+    else:
+        print(f"    [OK]   写名字 'local' 切换成功（免 Key 生效）")
+
+    # 4. 切换：use= 形式 + 带新 Key 覆盖
+    st.handle("use=zhipu", "", True)
+    if st.active != 0 or st.key != "sk-zhipu-1":
+        print(f"    [FAIL] use= 切换失败: active={st.active} key={st.key}")
+        ok = False
+    else:
+        print(f"    [OK]   use=zhipu 切换成功，取回已存 Key {st.key}")
+
+    st.handle("use=zhipu", "sk-rotated", True)
+    if st.keys[0] != "sk-rotated" or st.key != "sk-rotated":
+        print(f"    [FAIL] 密码栏更新 Key 未写回 profile: {st.keys[0]}")
+        ok = False
+    else:
+        print("    [OK]   密码栏输入新 Key 会写回该 API")
+
+    # 5. key= 直接写进配置串
+    st.handle("add=inline; preset=groq; key=sk-inline", "", True)
+    if st.keys[-1] != "sk-inline":
+        print(f"    [FAIL] key= 未生效: {st.keys[-1]}")
+        ok = False
+    else:
+        print("    [OK]   key= 写在配置串里同样生效")
+
+    # 6. 删除
+    st.handle("del=inline", "", True)
+    if "inline" in st.names or st.box != "deleted":
+        print(f"    [FAIL] 删除失败: {st.names}")
+        ok = False
+    else:
+        print(f"    [OK]   del=inline 删除成功，剩余 {st.names}")
+
+    # 7. 一次性配置（v0.5 兼容）不落库
+    before = list(st.names)
+    st.handle("https://my-gw.com/v1", "sk-gw", True)
+    if st.names != before or st.active != -1 or st.cfg.base != "https://my-gw.com/v1":
+        print(f"    [FAIL] 一次性配置行为不对: names={st.names} active={st.active}")
+        ok = False
+    else:
+        print("    [OK]   裸 URL 仍是一次性配置，不污染已存列表")
+
+    # 8. 名字大小写不敏感
+    st.handle("USE=ZHIPU", "", True)
+    if st.active != 0:
+        print(f"    [FAIL] 大小写不敏感匹配失败: active={st.active}")
+        ok = False
+    else:
+        print("    [OK]   use=ZHIPU 大小写不敏感")
+
+    return ok
+
+
 def check_json() -> bool:
     ok = True
     print("  [OpenAI 兼容格式]")
@@ -416,9 +707,10 @@ def check_api() -> bool:
     else:
         print("  [OK]   所有 Host* 调用都在 api.txt 中")
 
+    # substr 曾被误判为不存在 —— 官方 google.as 自己就用了 substr(start, count)，
+    # 所以它确实可用。这里只做提示，不再当作错误。
     if ".substr(" in code:
-        print("  [FAIL] 代码里又出现了 substr()（api.txt 的 string 类没有它）")
-        return False
+        print("  [NOTE] 使用了 substr()（google.as 证实可用；本脚本已统一改用 Left）")
 
     return not unknown_host
 
@@ -431,12 +723,16 @@ if __name__ == "__main__":
     a = check_balance(source)
     print("2) 函数引用")
     check_symbols(source)
-    print("3) 复刻逻辑验证（配置解析 / 双格式请求体）")
+    print("2b) 数字拼串（必须走 formatInt）")
+    d = check_concat(source)
+    print("3) 复刻逻辑验证")
     b = check_config()
+    b = check_profiles() and b
     b = check_json() and b
     print("4) 对照 PotPlayer 官方 API 文档 (api.txt)")
     c = check_api()
 
     print()
-    print("RESULT:", "PASS" if (a and b and c) else "FAIL")
-    sys.exit(0 if (a and b and c) else 1)
+    ok = a and b and c and d
+    print("RESULT:", "PASS" if ok else "FAIL")
+    sys.exit(0 if ok else 1)
