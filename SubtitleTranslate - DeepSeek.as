@@ -27,6 +27,21 @@
       * 修 v0.4/v0.5 的编译级 bug：int 不能隐式拼进字符串，
         必须用 formatInt()（见 api.txt 自带示例）
       * 候选配置存于 HostSaveString("profiles")，与 api_key 同一机制，已验证可用
+
+    v0.7  获取可用模型
+      * models / models=名字 拉取 GET /v1/models，弹窗列出并落成可复制的 txt
+      * model=@序号 直接选中清单里的第 N 个
+
+    v0.8  针对真实端点实测暴露的问题（Inception Labs / Mercury）
+      * maxtok= 可配（默认 256 → 512）
+      * body= 可往请求体注入任意 JSON 片段；推理模型必须
+        body="reasoning_effort":"none"，否则 reasoning 会吃光 max_tokens，
+        content 返回 null（实测 mercury-2.5 在 256 下 5 条全空）
+      * 新增 preset=inception，已带好上述 body 参数
+      * 修：error.message 非字符串时被当成"可重试"，现识别为结构化错误直接放弃
+      * 修：IsPermanentError 漏掉 "Incorrect API key"（Inception/OpenAI 的措辞）
+      * 修：ParseAccountSpec 改为两遍解析，显式值不再被 preset 按书写顺序冲掉
+      * 空内容 + usage 里有 reasoning_tokens → 给出可操作的修复提示
 */
 
 // ============================================================ Plugin info
@@ -35,7 +50,7 @@ string GetTitle() {
 }
 
 string GetVersion() {
-    return "0.7";
+    return "0.8";
 }
 
 string GetDesc() {
@@ -70,7 +85,10 @@ string cfgFormat = "openai";
 string cfgAuth   = "bearer";
 string cfgExtra  = "";
 string cfgUA     = "";
+string cfgBody   = "";      // 追加进请求体的原始 JSON 片段（如 "reasoning_effort":"none"）
 string specKey   = "";      // 配置串里 key= 的值（可选）
+
+int MAX_TOKENS = 512;       // 可用 maxtok= 调整；推理模型需要更大额度
 
 string acctSpec  = "";      // 「账户名称」原始内容
 int    activeProfile = -1;  // 当前使用的已保存 API 序号，-1 = 一次性配置
@@ -148,7 +166,7 @@ int ParseSmallInt(const string &in s) {
     string t = s.Trim();
     if (t.empty()) return -1;
     int i = 1;
-    while (i <= 999) {
+    while (i <= 4096) {
         if (formatInt(i) == t) return i;
         i++;
     }
@@ -205,16 +223,19 @@ int FindProfile(const string &in name) {
 }
 
 // 列出全部已保存的 API。会临时切换全局配置，所以先快照再还原。
-string snapB, snapM, snapF, snapA, snapE, snapU, snapK;
+string snapB, snapM, snapF, snapA, snapE, snapU, snapK, snapBo;
+int snapT = 512;
 
 void SnapshotCfg() {
     snapB = cfgBase; snapM = cfgModel; snapF = cfgFormat;
     snapA = cfgAuth; snapE = cfgExtra; snapU = cfgUA; snapK = api_key;
+    snapBo = cfgBody; snapT = MAX_TOKENS;
 }
 
 void RestoreCfg() {
     cfgBase = snapB; cfgModel = snapM; cfgFormat = snapF;
     cfgAuth = snapA; cfgExtra = snapE; cfgUA = snapU; api_key = snapK;
+    cfgBody = snapBo; MAX_TOKENS = snapT;
 }
 
 void ShowProfiles() {
@@ -251,12 +272,19 @@ void ApplyPreset(const string &in name) {
     cfgFormat = "openai";
     cfgAuth   = "bearer";
     cfgExtra  = "";
+    cfgBody   = "";
 
     if (name.empty() || name == "deepseek") return;
 
     if (name == "openai") {
         cfgBase = "https://api.openai.com/v1";
         cfgModel = "gpt-4o-mini";
+    } else if (name == "inception" || name == "mercury") {
+        // Mercury 是扩散式推理模型：不关推理会把 max_tokens 全用在 reasoning 上，
+        // 实测 content 直接返回 null（5 条全空）。必须显式关掉。
+        cfgBase = "https://api.inceptionlabs.ai/v1";
+        cfgModel = "mercury-2.5";
+        cfgBody = "\"reasoning_effort\":\"none\"";
     } else if (name == "siliconflow") {
         cfgBase = "https://api.siliconflow.cn/v1";
         cfgModel = "Qwen/Qwen2.5-7B-Instruct";
@@ -307,16 +335,31 @@ void ApplyPreset(const string &in name) {
 // 解析配置串。返回「规范化」后的串（去掉 key= 与 preset 展开前的原样保留），
 // 便于存进 profile。key= 的值放进 specKey。
 string ParseAccountSpec(const string &in spec) {
-    ApplyPreset("");
+    string s = spec.Trim();
     specKey = "";
 
-    string s = spec.Trim();
-    if (s.empty()) return "";
-
-    string norm = "";
+    // 第一遍：先定位 preset。
+    // 这样「显式写的值一定覆盖预设」与书写顺序无关 ——
+    // 例如 model=xxx; preset=zhipu 也能正确得到 xxx，否则会被预设冲掉。
     array<string> parts = s.split(";");
     int i = 0;
     int n = int(parts.length());
+    string pname = "";
+    while (i < n) {
+        string tk = parts[i].Trim();
+        i++;
+        int e0 = tk.find("=");
+        if (e0 == -1) continue;
+        if (tk.Left(e0).Trim().MakeLower() == "preset") {
+            pname = tk.Right(int(tk.length()) - e0 - 1).Trim().MakeLower();
+        }
+    }
+    ApplyPreset(pname);
+
+    if (s.empty()) return "";
+
+    string norm = "";
+    i = 0;
     while (i < n) {
         string tok = parts[i].Trim();
         i++;
@@ -338,7 +381,7 @@ string ParseAccountSpec(const string &in spec) {
             continue;                      // key 不进 profile 串，单独存
         }
         if (kl == "preset") {
-            ApplyPreset(v.MakeLower());
+            // 第一遍已经应用过，这里只记进 norm
         } else if (kl == "url" || kl == "base" || kl == "endpoint" || kl == "host") {
             cfgBase = v;
         } else if (kl == "model") {
@@ -355,6 +398,18 @@ string ParseAccountSpec(const string &in spec) {
             } else {
                 cfgModel = v;
             }
+        } else if (kl == "maxtok" || kl == "max_tokens" || kl == "maxtokens") {
+            // 推理模型需要更大额度，否则 reasoning 会把 max_tokens 吃光
+            int mt = ParseSmallInt(v);
+            if (mt > 0) {
+                MAX_TOKENS = mt;
+                Dbg("max_tokens = " + formatInt(MAX_TOKENS));
+            } else {
+                Dbg("maxtok 需要 1..4096 的整数，已忽略: " + v);
+            }
+        } else if (kl == "body" || kl == "params") {
+            // 追加进请求体的原始 JSON，例如 body="reasoning_effort":"none"
+            cfgBody = v;
         } else if (kl == "format") {
             cfgFormat = v.MakeLower();
         } else if (kl == "auth") {
@@ -895,7 +950,7 @@ string BuildRequest(const string &in text, const string &in src, const string &i
     if (cfgFormat == "anthropic") {
         req = "{\"model\":\"" + JsonEscape(cfgModel) + "\",";
         req += "\"system\":\"" + JsonEscape(sp) + "\",";
-        req += "\"max_tokens\":256,\"temperature\":0,\"messages\":[";
+        req += "\"messages\":[";
         i = start;
         bool first = true;
         while (i < n) {
@@ -906,7 +961,10 @@ string BuildRequest(const string &in text, const string &in src, const string &i
             i++;
         }
         if (!first) req += ",";
-        req += "{\"role\":\"user\",\"content\":\"" + JsonEscape(text) + "\"}]}";
+        req += "{\"role\":\"user\",\"content\":\"" + JsonEscape(text) + "\"}]";
+        req += ",\"max_tokens\":" + formatInt(MAX_TOKENS) + ",\"temperature\":0";
+        if (!cfgBody.empty()) req += "," + cfgBody;
+        req += "}";
         return req;
     }
 
@@ -919,19 +977,26 @@ string BuildRequest(const string &in text, const string &in src, const string &i
         i++;
     }
     req += ",{\"role\":\"user\",\"content\":\"" + JsonEscape(text) + "\"}]";
-    req += ",\"max_tokens\":256,\"temperature\":0}";
+    req += ",\"max_tokens\":" + formatInt(MAX_TOKENS) + ",\"temperature\":0";
+    if (!cfgBody.empty()) req += "," + cfgBody;
+    req += "}";
     return req;
 }
 
 bool IsPermanentError(const string &in msg) {
     if (msg.find("Authentication") != -1) return true;
     if (msg.find("authentication") != -1) return true;
+    if (msg.find("Unauthorized") != -1) return true;
     if (msg.find("Insufficient Balance") != -1) return true;
     if (msg.find("Invalid API key") != -1) return true;
+    if (msg.find("Incorrect API key") != -1) return true;   // Inception/OpenAI 的措辞
     if (msg.find("invalid_api_key") != -1) return true;
     if (msg.find("insufficient_quota") != -1) return true;
     if (msg.find("Model Not Exist") != -1) return true;
     if (msg.find("model_not_found") != -1) return true;
+    if (msg.find("Model must be one of") != -1) return true; // 结构化校验错误
+    if (msg.find("Value error") != -1) return true;
+    if (msg.find("No such model") != -1) return true;
     if (msg.find("invalid_request_error") != -1) return true;
     return false;
 }
@@ -1032,6 +1097,24 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
                 HostPrintUTF8("{$CP0=Permanent error, giving up on this line.$}\n");
                 return "[翻译服务报错]";
             }
+        } else if (Root["error"].isObject()) {
+            // 有些服务的 error.message 不是字符串，而是结构化校验错误
+            // （例如模型名非法时返回的 Pydantic 列表）。这类基本是请求本身的问题，
+            // 重试不会变好，直接放弃并原样打出来便于定位。
+            HostPrintUTF8("{$CP0=API returned a structured error (not a plain message).$}\n");
+            HostPrintUTF8("  " + response.Left(400) + "\n");
+            return "[翻译服务报错]";
+        } else if (!gotIt) {
+            // 没有报错、也没有内容 —— 多半是推理模型把 max_tokens 全用在 reasoning 上，
+            // content 返回 null。实测 mercury-2.5 在 max_tokens=256 时必然如此。
+            JsonValue rt = Root["usage"]["completion_tokens_details"]["reasoning_tokens"];
+            if (rt.isInt() || rt.isUInt()) {
+                HostPrintUTF8("{$CP0=Empty content: the model spent the whole token budget on reasoning.$}\n");
+                HostPrintUTF8("  hint: add  body=\"reasoning_effort\":\"none\"  or raise  maxtok=1024\n");
+                return "[推理占满额度]";
+            }
+            HostPrintUTF8("{$CP0=Translation failed. Retrying...$}\n");
+            Dbg("raw: " + response.Left(300));
         } else {
             HostPrintUTF8("{$CP0=Translation failed. Retrying...$}\n");
             Dbg("raw: " + response.Left(300));

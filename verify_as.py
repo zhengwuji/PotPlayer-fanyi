@@ -182,6 +182,8 @@ class Cfg:
         self.auth = ""
         self.extra = ""
         self.ua = ""
+        self.body = ""
+        self.max_tokens = 512
 
 
 def apply_preset(cfg: Cfg, name: str) -> None:
@@ -191,7 +193,14 @@ def apply_preset(cfg: Cfg, name: str) -> None:
     cfg.fmt = "openai"
     cfg.auth = "bearer"
     cfg.extra = ""
+    cfg.body = ""
     if not name or name == "deepseek":
+        return
+    if name == "inception":
+        # Mercury 是扩散式推理模型，必须关推理，否则 content 返回 null
+        cfg.base = "https://api.inceptionlabs.ai/v1"
+        cfg.model = "mercury-2.5"
+        cfg.body = "\"reasoning_effort\":\"none\""
         return
     if name in PRESETS:
         b, m, f, a = PRESETS[name]
@@ -304,17 +313,23 @@ def build_request(cfg: Cfg, text, src, dst, pairs):
             msgs.append({"role": "assistant", "content": d})
         msgs.append({"role": "user", "content": text})
         expected = {"model": cfg.model, "system": sp,
-                    "max_tokens": 256, "temperature": 0, "messages": msgs}
+                    "messages": msgs,
+                    "max_tokens": cfg.max_tokens, "temperature": 0}
 
         raw = '{"model":"' + json_escape(cfg.model) + '",'
         raw += '"system":"' + json_escape(sp) + '",'
-        raw += '"max_tokens":256,"temperature":0,"messages":['
+        raw += '"messages":['
         parts = []
         for s, d in sel:
             parts.append('{"role":"user","content":"' + json_escape(s) + '"}')
             parts.append('{"role":"assistant","content":"' + json_escape(d) + '"}')
         parts.append('{"role":"user","content":"' + json_escape(text) + '"}')
-        raw += ",".join(parts) + "]}"
+        raw += ",".join(parts) + "]"
+        raw += ',"max_tokens":' + str(cfg.max_tokens) + ',"temperature":0'
+        if cfg.body:
+            raw += "," + cfg.body
+            expected.update(json.loads("{" + cfg.body + "}"))
+        raw += "}"
         return expected, raw
 
     msgs = [{"role": "system", "content": sp}]
@@ -323,7 +338,7 @@ def build_request(cfg: Cfg, text, src, dst, pairs):
         msgs.append({"role": "assistant", "content": d})
     msgs.append({"role": "user", "content": text})
     expected = {"model": cfg.model, "messages": msgs,
-                "max_tokens": 256, "temperature": 0}
+                "max_tokens": cfg.max_tokens, "temperature": 0}
 
     raw = '{"model":"' + json_escape(cfg.model) + '","messages":['
     raw += '{"role":"system","content":"' + json_escape(sp) + '"}'
@@ -331,7 +346,11 @@ def build_request(cfg: Cfg, text, src, dst, pairs):
         raw += ',{"role":"user","content":"' + json_escape(s) + '"}'
         raw += ',{"role":"assistant","content":"' + json_escape(d) + '"}'
     raw += ',{"role":"user","content":"' + json_escape(text) + '"}'
-    raw += '],"max_tokens":256,"temperature":0}'
+    raw += '],"max_tokens":' + str(cfg.max_tokens) + ',"temperature":0'
+    if cfg.body:
+        raw += "," + cfg.body
+        expected.update(json.loads("{" + cfg.body + "}"))
+    raw += "}"
     return expected, raw
 
 
@@ -376,15 +395,26 @@ FIELD_SEP = "\u0002"
 
 
 def parse_account_spec_full(cfg: Cfg, spec: str):
-    """复刻 v0.6 的 ParseAccountSpec()，返回 (norm, spec_key)"""
-    apply_preset(cfg, "")
+    """复刻 v0.8 的 ParseAccountSpec()：两遍解析，返回 (norm, spec_key)"""
     spec_key = ""
     s = spec.strip()
+
+    # 第一遍：先定位 preset，保证显式写的值不被预设按书写顺序冲掉
+    parts = [t.strip() for t in s.split(";")]
+    pname = ""
+    for tok in parts:
+        if "=" not in tok:
+            continue
+        k, v = tok.split("=", 1)
+        if k.strip().lower() == "preset":
+            pname = v.strip().lower()
+    apply_preset(cfg, pname)
+
     if not s:
         return "", ""
+
     norm = ""
-    for tok in s.split(";"):
-        tok = tok.strip()
+    for tok in parts:
         if not tok:
             continue
         if "=" not in tok:
@@ -397,11 +427,17 @@ def parse_account_spec_full(cfg: Cfg, spec: str):
             spec_key = v
             continue
         if kl == "preset":
-            apply_preset(cfg, v.lower())
+            pass                       # 第一遍已应用
         elif kl in ("url", "base", "endpoint", "host"):
             cfg.base = v
         elif kl == "model":
             cfg.model = v
+        elif kl in ("maxtok", "max_tokens", "maxtokens"):
+            mt = parse_small_int(v)
+            if mt > 0:
+                cfg.max_tokens = mt
+        elif kl in ("body", "params"):
+            cfg.body = v
         elif kl == "format":
             cfg.fmt = v.lower()
         elif kl == "auth":
@@ -632,12 +668,15 @@ def resolve_models_url(cfg: Cfg) -> str:
     return u + "/models"
 
 
+SMALL_INT_MAX = 4096   # 必须与 .as 里 ParseSmallInt() 的上限一致（有断言守着）
+
+
 def parse_small_int(s: str):
-    """复刻 ParseSmallInt()：只认 1..999"""
+    """复刻 ParseSmallInt()：只认 1..SMALL_INT_MAX"""
     t = s.strip()
     if not t:
         return -1
-    for i in range(1, 1000):
+    for i in range(1, SMALL_INT_MAX + 1):
         if str(i) == t:
             return i
     return -1
@@ -663,6 +702,40 @@ def parse_models_payload(root):
 def check_models() -> bool:
     print("  [可用模型获取]")
     ok = True
+
+    # 0. Inception 预设必须带好「关推理」的 body 参数
+    c = Cfg()
+    parse_account_spec_full(c, "preset=inception")
+    got = (c.base, c.model, c.body)
+    want = ("https://api.inceptionlabs.ai/v1", "mercury-2.5",
+            "\"reasoning_effort\":\"none\"")
+    if got != want:
+        print(f"    [FAIL] preset=inception 期望 {want} 实得 {got}")
+        ok = False
+    else:
+        print("    [OK]   preset=inception 自带 reasoning_effort=none")
+
+    # 0b. 显式值必须能覆盖预设，且与书写顺序无关
+    for spec, want_model in [
+        ("preset=inception; model=mercury-2", "mercury-2"),
+        ("model=mercury-2; preset=inception", "mercury-2"),
+    ]:
+        c2 = Cfg()
+        parse_account_spec_full(c2, spec)
+        if c2.model != want_model:
+            print(f"    [FAIL] '{spec}' 期望 {want_model} 实得 {c2.model}")
+            ok = False
+    print("    [OK]   显式 model= 不被 preset 按书写顺序冲掉")
+
+    # 0c. maxtok 解析
+    for spec, want_mt in [("maxtok=512", 512), ("max_tokens=1024", 1024),
+                          ("maxtokens=128", 128), ("maxtok=0", 512), ("maxtok=abc", 512)]:
+        c3 = Cfg()
+        parse_account_spec_full(c3, spec)
+        if c3.max_tokens != want_mt:
+            print(f"    [FAIL] {spec} 期望 {want_mt} 实得 {c3.max_tokens}")
+            ok = False
+    print("    [OK]   maxtok 解析与非法值回退正确")
 
     # 1. models 端点推导
     cases = [
@@ -708,12 +781,26 @@ def check_models() -> bool:
             print(f"    [OK]   {label} -> {got}")
 
     # 3. 序号解析
-    for text, want in [("1", 1), ("12", 12), ("999", 999), ("0", -1), ("1000", -1), ("", -1)]:
+    for text, want in [("1", 1), ("12", 12), ("999", 999), ("1024", 1024),
+                       ("4096", 4096), ("0", -1), ("4097", -1), ("", -1)]:
         got = parse_small_int(text)
         if got != want:
             print(f"    [FAIL] ParseSmallInt('{text}') 期望 {want} 实得 {got}")
             ok = False
-    print("    [OK]   序号解析 1..999 行为正确")
+    print(f"    [OK]   序号解析 1..{SMALL_INT_MAX} 行为正确")
+
+    # 3b. 复刻层漂移防护：.as 里的上限必须与这里一致
+    with open(SRC, "r", encoding="utf-8") as fh:
+        as_src = fh.read()
+    m = re.search(r"int ParseSmallInt[\s\S]*?while \(i <= (\d+)\)", as_src)
+    if not m:
+        print("    [FAIL] 在 .as 里没找到 ParseSmallInt 的上限")
+        ok = False
+    elif int(m.group(1)) != SMALL_INT_MAX:
+        print(f"    [FAIL] 复刻层漂移：.as 上限 {m.group(1)}，复刻层 {SMALL_INT_MAX}")
+        ok = False
+    else:
+        print(f"    [OK]   复刻层与 .as 的上限一致（{SMALL_INT_MAX}）")
 
     # 4. model=@N 取值
     cfg = Cfg()

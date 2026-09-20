@@ -278,6 +278,38 @@ v0.4.1 时我依据 `api.txt` 判断 "string 类没有 `substr`"，并为此写�
 本脚本仍统一使用文档明确收录的 `Left()`，但禁用规则已从 "FAIL" 降为提示。
 那条依据不成立的硬规则已撤销。
 
+### 推理模型（v0.8）—— 真实端点实测倒逼出来的能力
+
+拿 Inception Labs 的 Mercury 实测时发现一个**会让插件完全不可用**的情况：
+
+Mercury 是扩散式推理模型，默认会先输出一大段 reasoning。我们原来的 `max_tokens: 256`
+被 reasoning **全部吃掉**，`content` 返回 `null`，插件取值拿到空 → 重试 3 次 → `[翻译失败]`。
+
+实测数据（mercury-2.5，5 条字幕）：
+
+| 配置 | 成功 | 每次 reasoning token |
+|---|---|---|
+| 默认（无 body 参数） | **0/5** | 491 ~ 510（把额度吃光） |
+| `body="reasoning_effort":"none"` | **5/5** | **0** |
+
+所以 v0.8 加了两个配置键：
+
+| 键 | 说明 |
+|---|---|
+| `maxtok=1024` | 覆盖 `max_tokens`（默认 512，接受 1..4096） |
+| `body="键":"值",...` | 往请求体里注入任意 JSON 片段 |
+
+并内置了 `preset=inception`，已带好 `body="reasoning_effort":"none"`：
+
+```
+add=inception; preset=inception
+```
+
+**用别的推理模型时**（DeepSeek-R1 类、各类 thinking 模型）同样适用：
+先看日志里有没有出现 `[推理占满额度]`，有就加 `body=` 或加大 `maxtok=`。
+插件检测到「无报错 + 无内容 + usage 里有 reasoning_tokens」时会直接把修复方法打出来。
+
+
 ### 配置项语法（`add=` 之后、或一次性配置时使用）
 
 分号 `;` 分隔，每项 `键=值`；也可以**直接填一个裸 URL**（等价于 `url=...`）。
@@ -290,7 +322,9 @@ v0.4.1 时我依据 `api.txt` 判断 "string 类没有 `substr`"，并为此写�
 | `format` | — | `openai` 或 `anthropic` | `openai` |
 | `auth` | — | 认证方式，见下表 | `bearer` |
 | `extra` | `header` | 额外请求头，`Name:Value\|Name:Value` | 空 |
-| `ua` | `useragent` | 自定义 User-Agent | `PotPlayer-DeepSeek-Translate/0.5` |
+| `maxtok` | `max_tokens` `maxtokens` | 输出 token 上限（1..4096） | 512 |
+| `body` | `params` | 注入请求体的原始 JSON 片段 | 空 |
+| `ua` | `useragent` | 自定义 User-Agent | `PotPlayer-DeepSeek-Translate/0.8` |
 
 **地址自动补全**：只填域名或 `.../v1` 都会补成完整路径；已经含 `/chat/completions`
 或 `/messages` 的则原样使用。已识别 `/v1` `/v2` `/v3` `/v4` 版本段，
@@ -481,10 +515,13 @@ ModuleNotFoundError: No module named 'email'
 ```powershell
 python verify_as.py            # .as 静态自检 + 复刻逻辑断言 + api.txt 交叉校验
 python test_concat_checker.py  # 反向验证：对已知缺陷版本必须报 FAIL
-python test_api_contract.py    # HTTP 契约测试（本地 mock 服务，22 项）
+python test_api_contract.py    # HTTP 契约测试（本地 mock 服务）
 python test_install.py         # 安装落盘端到端测试（临时目录，不碰 PotPlayer）
 python bench_ctx.py            # 原版 context 膨胀量化
 python -m py_compile installer.py
+
+# 打真实端点（key 从环境变量读，不落仓库）
+$env:LIVE_API_KEY="sk-..."; python test_live_endpoint.py
 
 # exe 冒烟自检（不写盘、不触发 UAC，打印内嵌资源的 SHA256）
 .\dist\PotPlayer-DeepSeek-Translate-Installer.exe --check
@@ -497,7 +534,7 @@ python -m py_compile installer.py
 用 `--check` 打印的 SHA256 与下面比对，即可确认 exe 内嵌的正是本分支的 v0.5 脚本：
 
 ```
-8377525152f9ab08401ef2fbcf7d280939bc98e18180c62d8253aa79a39f3d12  SubtitleTranslate - DeepSeek.as
+45d4af49a5ebf0ee483e51f53bcf071fed5e03b78fc7da3222bcd0c5fbe07b74  SubtitleTranslate - DeepSeek.as
 2cef8f8a8b0d8fc9beaf954ec49a9c19952dff9eb5f0f753f8f54ec02d41ed89  SubtitleTranslate - DeepSeek.ico
 ```
 

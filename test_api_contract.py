@@ -230,7 +230,7 @@ def main():
         ("model 透传", cap["body"]["model"] == "test-model"),
         ("messages[0] 是 system", cap["body"]["messages"][0]["role"] == "system"),
         ("末条是待译正文", cap["body"]["messages"][-1]["content"] == "Where are we going"),
-        ("max_tokens=256", cap["body"]["max_tokens"] == 256),
+        ("max_tokens 用默认 512", cap["body"]["max_tokens"] == 512),
         ("HTTP 200", status == 200),
         ("解析 choices[0].message.content", extract_text(cfg, resp) == "我们要去哪里"),
     ]
