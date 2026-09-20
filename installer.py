@@ -245,8 +245,6 @@ def get_path_from_shortcut(shortcut_path):
 def install(strings):
     print("Starting installation...")
     print("---------------------------------------------------------")
-    print("本安装程序由GitHub Felix3322实现，原项目地址：https://github.com/Felix3322/PotPlayer_Chatgpt_Translate")
-    print("本安装程序由哔哩哔哩沧浪同学修改，原项目地址：https://github.com/Liu8Can/PotPlayer_DeepSeek_Translate")
     print("本安装程序适用于PotPlayer的DeepSeek字幕翻译插件，一键安装。")
     print("---------------------------------------------------------")
 
