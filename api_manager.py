@@ -269,6 +269,51 @@ def fetch_models(api, timeout=25):
     return out, "" if out else "列表为空"
 
 
+def explain_error(msg):
+    """把常见报错翻译成「下一步该干什么」。
+
+    这些提示全部来自实际踩到的坑，不是泛泛而谈。
+    """
+    m = msg or ""
+    hints = []
+
+    if "ConnectionResetError" in m or "10054" in m:
+        hints.append("端口上确实有服务，但它中途把连接断掉了。常见原因：")
+        hints.append("  · 本地网关/代理过载或限流 —— 稍等几秒重试即可")
+        hints.append("  · 协议选错了：网关是 OpenAI 兼容时，「协议」要选 openai 而不是 anthropic")
+    elif "ConnectionRefused" in m or "10061" in m:
+        hints.append("这个端口上没有服务在监听 —— 本地服务没启动，或地址/端口写错。")
+
+    if "invalid API key" in m or "Incorrect API key" in m:
+        hints.append("Key 不被接受。如果连的是本地网关，注意这里有两套 Key：")
+        hints.append("  · 客户端 Key —— 给插件/客户端用的（如 ccgw-...），应该填这个")
+        hints.append("  · 上游账号 Key —— 网关拿去访问上游的（如 user_...），填它会 401")
+    elif "missing Authorization header" in m:
+        hints.append("完全没发认证头 —— 检查「认证」是否被设成了 none，或 Key 是空的。")
+
+    if "MODEL_NOT_IN_PLAN" in m:
+        hints.append("该模型不在你的套餐内 —— 用「获取可用模型」换一个能用的。")
+
+    if "model_not_found" in m or "No such model" in m or "Model Not Exist" in m:
+        hints.append("模型名不对 —— 用「获取可用模型」从列表里挑，别手打。")
+
+    if "reasoning" in m and "token" in m:
+        hints.append("这是推理模型把输出额度吃光了 —— 勾选「关闭模型推理」。")
+
+    return "\n".join(hints)
+
+
+def dialog_text(msg, api=None):
+    """拼成最终展示给用户的文本"""
+    extra = explain_error(msg)
+    return msg + ("\n\n———————— 诊断建议 ————————\n" + extra if extra else "")
+
+
+def murl_of(api):
+    """该 API 实际会去请求的 models 端点，报错时一并显示便于核对"""
+    return resolve_urls(api.get("url", ""), api.get("format", "openai"))[1] or "(地址为空)"
+
+
 def ping(api, timeout=30):
     """发一次最小翻译请求，返回 (是否成功, 说明)"""
     chat, _ = resolve_urls(api.get("url", ""), api.get("format", "openai"))
@@ -685,7 +730,7 @@ def run_gui(auto_close_ms=None):
         models, err = fetch_models(a)
         if err:
             status.set("获取失败")
-            messagebox.showerror("获取可用模型失败", err)
+            messagebox.showerror("获取可用模型失败", dialog_text(err) + f"\n\n地址：{murl_of(a)}")
             return
         status.set(f"取到 {len(models)} 个模型")
 
@@ -724,8 +769,10 @@ def run_gui(auto_close_ms=None):
         ok, msg = ping(a)
         status.set(msg)
         (messagebox.showinfo if ok else messagebox.showerror)(
-            "测试连通性", msg + ("\n\n注意：PotPlayer 里的「测试」按钮会返回缓存结果，"
-                                 "改配置后要改一下测试文本。" if ok else ""))
+            "测试连通性",
+            msg + ("\n\n注意：PotPlayer 里的「测试」按钮会返回缓存结果，"
+                   "改配置后要改一下测试文本。" if ok else "\n\n———————— 诊断建议 ————————\n"
+                   + explain_error(msg)))
 
     # 首次运行：没有记录时，试着从插件配置导入一条
     if not store["apis"]:
@@ -844,6 +891,24 @@ def selftest():
     h3 = build_headers(c2)
     check("anthropic 用 x-api-key + version",
           h3.get("x-api-key") == "sk-a" and h3.get("anthropic-version") == "2023-06-01")
+
+    print("5) 报错诊断建议")
+    cases = [
+        ("ConnectionResetError: [WinError 10054]", "协议选错"),
+        ("HTTP 401: invalid API key", "客户端 Key"),
+        ("HTTP 403: MODEL_NOT_IN_PLAN", "套餐"),
+        ("HTTP 401: missing Authorization header", "认证头"),
+        ("reasoning_tokens", "推理"),
+    ]
+    for msg, want in cases:
+        got = explain_error(msg)
+        check(f"{msg[:34]!r} 有建议且提到「{want}」", want in got)
+    check("无法识别的错误不硬编建议", explain_error("something weird") == "")
+
+    print("6) models 端点展示")
+    check("murl_of 正确", murl_of(a) == "https://api.inceptionlabs.ai/v1/models",
+          murl_of(a))
+    check("地址为空时不炸", murl_of(blank_api()) == "(地址为空)")
 
     print()
     print("RESULT:", "PASS" if ok else "FAIL")
