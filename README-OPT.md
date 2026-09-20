@@ -168,9 +168,101 @@ PotPlayer 版本不支持该方法，删掉那 3 行截断逻辑即可，其余�
 
 ## 五、部署
 
+### 方式 A：一键安装器 exe（推荐）
+
+直接运行仓库根目录的：
+
+```
+dist\PotPlayer-DeepSeek-Translate-Installer.exe
+```
+
+会自动请求管理员权限（UAC），然后扫描硬盘找 PotPlayer 的 `Translate` 目录并安装。
+**整个过程不需要联网**——插件本体已内嵌在 exe 里。
+
+先自检（不写盘、不触发 UAC），确认 exe 完好：
+
+```powershell
+.\dist\PotPlayer-DeepSeek-Translate-Installer.exe --check
+```
+
+### 方式 B：手工复制
+
 1. 把 `SubtitleTranslate - DeepSeek.as` 和 `SubtitleTranslate - DeepSeek.ico` 复制到
    PotPlayer 的翻译插件目录，例如
    `D:\Program Files\DAUM\PotPlayer\Extension\Subtitle\Translate`
 2. 重启 PotPlayer。
 3. 设置里：**账户名称**留空（或用自定义端点），**密码**填 DeepSeek API Key。
 4. 想排查问题就把脚本里的 `DEBUG_LOG` 改成 `true`，然后看 PotPlayer 的日志。
+
+---
+
+## 六、从源码构建 exe
+
+原版仓库把 `build/` `dist/` `*.spec` 全部写进了 `.gitignore`，所以 Releases 里的
+`installer.exe` **无法从源码复现**——这是"仓库不是完整源码"的真正缺口。本分支补上了：
+
+```
+installer.spec               PyInstaller 配置（含图标、版本资源、hiddenimports）
+file_version_info.txt        exe 的版本资源（属性页里能看到 0.4.0.0）
+requirements-build.txt       构建期依赖
+```
+
+构建：
+
+```powershell
+python -m pip install -r requirements.txt -r requirements-build.txt
+python -m PyInstaller installer.spec --noconfirm --clean
+# 产物: dist\PotPlayer-DeepSeek-Translate-Installer.exe  (约 15 MB)
+```
+
+### 冻结模式下的三个必要修正
+
+把 `installer.py` 打包成 exe 后，有三处会出真实故障，已一并修好：
+
+| 问题 | 原因 | 修正 |
+|---|---|---|
+| 找不到内嵌资源 | `__file__` 在 onefile 下指向 `sys._MEIPASS` 临时目录 | 新增 `resource_dir()`，冻结时返回 `sys._MEIPASS` |
+| 提权重启会自我递归 | `shell32.ShellExecuteW(..., sys.executable, list2cmdline(sys.argv))` 在冻结后会把 exe 自身路径当参数回传 | 冻结时 `params=""` |
+| `--check` 无法自检 | 原本没有任何非交互入口，一跑就弹 UAC 或卡在菜单 | 新增 `--check` / `--version` |
+
+### 打包踩坑记录（供后续维护）
+
+**不要**在 `installer.spec` 的 `excludes` 里排除 `email` / `html` / `http.server` /
+`sqlite3` / `distutils` / `setuptools`。首版这样排之后，exe 一启动就崩：
+
+```
+File "urllib3\exceptions.py", line 6, in <module>
+ModuleNotFoundError: No module named 'email'
+```
+
+`urllib3`（`requests` 的依赖）间接依赖 `email`。目前只排除确定用不到的
+`tkinter` / `PIL` / `numpy` / `pandas` / `matplotlib` / `scipy` / `pytest`。
+
+---
+
+## 七、验证命令一览
+
+```powershell
+python verify_as.py            # .as 静态自检：括号配平 + 函数引用 + JSON 结构
+python bench_ctx.py            # 原版 context 膨胀量化
+python test_install.py         # 安装落盘端到端测试（临时目录，不碰 PotPlayer）
+python -m py_compile installer.py
+
+# exe 冒烟自检（打印内嵌资源的 SHA256，可与源文件比对）
+.\dist\PotPlayer-DeepSeek-Translate-Installer.exe --check
+```
+
+全部输出 `PASS`。
+
+### 内嵌资源哈希（v0.4 当前值）
+
+```
+b5dad273c3ee355dfa1898b859274d86ed71725c37cf8152756a3959db863fb9  SubtitleTranslate - DeepSeek.as
+2cef8f8a8b0d8fc9beaf954ec49a9c19952dff9eb5f0f753f8f54ec02d41ed89  SubtitleTranslate - DeepSeek.ico
+```
+
+`--check` 打印的哈希与上表一致，即证明 exe 内嵌的是本分支的 v0.4 脚本。
+
+**未验证部分**：本机没有 PotPlayer 的 AngelScript 运行时，因此
+**`.as` 脚本未经真实加载测试**。`Finalize()` 里用到了 `string.substr()`，若你的
+PotPlayer 版本不支持该方法，删掉那 3 行截断逻辑即可，其余部分不受影响。

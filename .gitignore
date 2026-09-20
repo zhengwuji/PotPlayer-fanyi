@@ -5,8 +5,10 @@
 build/
 dist/
 
-# 忽略 PyInstaller 的 .spec 文件
-*.spec
+# 注意：installer.spec 必须纳入版本控制，
+# 否则 Releases 里的 installer.exe 无法从源码复现。
+# 原版此处是 *.spec，已移除。
+!installer.spec
 
 # 忽略 Python 缓存文件
 __pycache__/

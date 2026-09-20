@@ -2,6 +2,7 @@ import os
 import sys
 import ctypes
 import shutil
+import hashlib
 import requests
 import locale
 import win32com.client
@@ -61,6 +62,13 @@ def get_language():
     return "zh"  # 默认设置为中文
 
 
+# 资源目录：打包成 exe 后 datas 会被解压到 sys._MEIPASS；源码运行时用脚本所在目录
+def resource_dir():
+    if getattr(sys, "frozen", False):
+        return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(sys.executable)))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 # 检测是否以管理员权限运行
 def is_admin():
     try:
@@ -73,7 +81,10 @@ def is_admin():
 def restart_as_admin(strings):
     print(strings["admin_required"])
     if sys.platform == "win32":
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, subprocess.list2cmdline(sys.argv), None, 1)
+        # 冻结成 exe 后 sys.executable 就是本 exe，不能再把 sys.argv 原样传回去
+        # （否则会把 exe 自身路径当成参数重启）
+        params = "" if getattr(sys, "frozen", False) else subprocess.list2cmdline(sys.argv)
+        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, params, None, 1)
     else:
         print("This script requires administrator privileges, but it is not running on Windows.")
     sys.exit()
@@ -159,7 +170,7 @@ def install_asset(filename, validator, strings, target_dir):
     """先尝试安装器同目录的本地文件（离线安装），再依次尝试各下载源。"""
     dest = os.path.join(target_dir, filename)
 
-    local = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    local = os.path.join(resource_dir(), filename)
     if os.path.exists(local) and validator(local):
         shutil.copyfile(local, dest)
         print(f"Local copy used: {local} -> {dest}")
@@ -288,7 +299,49 @@ def install(strings):
     print(strings["installation_complete"].format(target_path))
 
 
+APP_VERSION = "0.4"
+
+
+def self_check():
+    """打包后的冒烟自检：确认内嵌资源有效、关键依赖可加载。不写任何文件。"""
+    print(f"PotPlayer DeepSeek Translate installer v{APP_VERSION}")
+    print(f"frozen        : {getattr(sys, 'frozen', False)}")
+    print(f"resource_dir  : {resource_dir()}")
+    print(f"target arch   : {sys.maxsize > 2**32 and '64-bit' or '32-bit'}")
+
+    rc = 0
+    for filename, validator in (
+        ("SubtitleTranslate - DeepSeek.as", validate_as),
+        ("SubtitleTranslate - DeepSeek.ico", validate_ico),
+    ):
+        path = os.path.join(resource_dir(), filename)
+        exists = os.path.exists(path)
+        valid = bool(exists and validator(path))
+        size = os.path.getsize(path) if exists else 0
+        print(f"  {'OK ' if valid else 'BAD'} {filename}  {size} bytes")
+        if exists:
+            with open(path, "rb") as fh:
+                print(f"      sha256 {hashlib.sha256(fh.read()).hexdigest()}")
+        if not valid:
+            rc = 1
+
+    for mod in ("requests", "win32com.client"):
+        try:
+            __import__(mod)
+            print(f"  OK  {mod}")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  BAD {mod}: {exc}")
+            rc = 1
+
+    print("RESULT:", "PASS" if rc == 0 else "FAIL")
+    return rc
+
+
 def main():
+    # 打包后的冒烟自检入口：不触发提权、不进入交互菜单
+    if "--check" in sys.argv or "--version" in sys.argv:
+        sys.exit(self_check())
+
     lang = get_language()
     strings = LANGUAGE_STRINGS[lang]
 
