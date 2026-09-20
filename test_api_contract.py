@@ -19,7 +19,8 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from verify_as import Cfg, parse_account_spec, resolve_url, build_request
+from verify_as import (Cfg, parse_account_spec, resolve_url, build_request,
+                       resolve_models_url, parse_models_payload, parse_small_int)
 
 CAPTURED = []
 
@@ -29,6 +30,32 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):
         pass
+
+    def do_GET(self):
+        """GET /v1/models —— 「获取可用模型」用的就是这条"""
+        try:
+            CAPTURED.append({
+                "path": self.path,
+                "auth": self.headers.get("Authorization"),
+                "x_api_key": self.headers.get("x-api-key"),
+            })
+            # 注意顺序：/ollama/models 也以 /models 结尾，必须先判它
+            if self.path.endswith("/ollama/models"):
+                self._json({"models": [{"name": "qwen2.5:7b"}, {"name": "llama3:8b"}]})
+                return
+            if self.path.endswith("/v1/models") or self.path.endswith("/models"):
+                self._json({"object": "list", "data": [
+                    {"id": "deepseek-chat", "object": "model"},
+                    {"id": "deepseek/deepseek-v4-pro", "object": "model"},
+                    {"id": "meituan/LongCat-2.0:free", "object": "model"},
+                    {"nope": "missing id"},
+                    {"id": "poo1side/laguna-s-2.1-free", "object": "model"},
+                ]})
+                return
+            self._json({"error": {"message": "not found"}}, 404)
+        except Exception:
+            import traceback
+            traceback.print_exc()
 
     def do_POST(self):
         try:
@@ -91,8 +118,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        # 显式关闭连接：HTTP/1.1 的 keep-alive 会让服务端线程继续阻塞在读，
+        # 客户端先关就会偶发 RST，测试变成随机的。
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(data)
+        self.close_connection = True
+
+
+class QuietServer(ThreadingHTTPServer):
+    """连接收尾时的 RST 不该刷 traceback 干扰测试输出。"""
+
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        pass
 
 
 # ---- 复刻 AngelScript 的 BuildHeaders() -----------------------------------
@@ -134,21 +175,38 @@ def extract_text(cfg: Cfg, root: dict):
     return None
 
 
-def post(port, path, body, headers):
+def _request(method, port, path, data, headers, retries=3):
+    """HTTP 请求：对偶发连接重置做有限重试，避免测试自身 flaky。"""
+    import time
+    import urllib.error
     import urllib.request
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{port}{path}",
-        data=json.dumps(body).encode("utf-8"),
-        headers=headers, method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status, json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        return e.code, json.loads(e.read().decode("utf-8"))
+
+    last = None
+    for attempt in range(retries):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}",
+                                     data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read().decode("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            time.sleep(0.1 * (attempt + 1))
+    raise last
+
+
+def post(port, path, body, headers):
+    return _request("POST", port, path,
+                    json.dumps(body).encode("utf-8"), headers)
+
+
+def get(port, path, headers):
+    return _request("GET", port, path, None, headers)
 
 
 def main():
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = QuietServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
     threading.Thread(target=server.serve_forever, daemon=True).start()
     print(f"mock 服务: http://127.0.0.1:{port}\n")
@@ -229,6 +287,48 @@ def main():
     for name, good in [
         ("X-Tenant", h4.get("X-Tenant") == "abc"),
         ("X-Trace", h4.get("X-Trace") == "42"),
+    ]:
+        print(f"   [{'OK' if good else 'FAIL'}] {name}")
+        ok = ok and good
+
+    # ---------- 5. 获取可用模型 ----------
+    print("\n5) 获取可用模型 (GET /v1/models)")
+    cfg5 = Cfg()
+    parse_account_spec(cfg5, f"url=http://127.0.0.1:{port}/v1")
+    murl = resolve_models_url(cfg5)
+    status, resp = get(port, murl.replace(f"http://127.0.0.1:{port}", ""),
+                       build_headers(cfg5, "sk-test123"))
+    cap = CAPTURED[-1]
+    models = parse_models_payload(resp)
+    checks = [
+        ("路径推导正确", cap["path"] == "/v1/models"),
+        ("GET 也带认证头", cap["auth"] == "Bearer sk-test123"),
+        ("HTTP 200", status == 200),
+        ("解析出模型 id", models == ["deepseek-chat", "deepseek/deepseek-v4-pro",
+                                     "meituan/LongCat-2.0:free",
+                                     "poo1side/laguna-s-2.1-free"]),
+        ("缺 id 的条目被跳过", all("nope" not in m for m in models)),
+    ]
+    for name, good in checks:
+        print(f"   [{'OK' if good else 'FAIL'}] {name}")
+        ok = ok and good
+
+    # 用序号选中
+    pick = parse_small_int("2")
+    chosen = models[pick - 1] if 1 <= pick <= len(models) else ""
+    for name, good in [
+        ("model=@2 命中第 2 个", chosen == "deepseek/deepseek-v4-pro"),
+    ]:
+        print(f"   [{'OK' if good else 'FAIL'}] {name}")
+        ok = ok and good
+
+    # Ollama 原生形状
+    cfg5b = Cfg()
+    parse_account_spec(cfg5b, f"url=http://127.0.0.1:{port}/ollama")
+    _, resp2 = get(port, "/ollama/models", build_headers(cfg5b, "x"))
+    got2 = parse_models_payload(resp2)
+    for name, good in [
+        ("models[].name 形状兼容", got2 == ["qwen2.5:7b", "llama3:8b"]),
     ]:
         print(f"   [{'OK' if good else 'FAIL'}] {name}")
         ok = ok and good

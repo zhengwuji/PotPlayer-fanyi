@@ -35,7 +35,7 @@ string GetTitle() {
 }
 
 string GetVersion() {
-    return "0.6";
+    return "0.7";
 }
 
 string GetDesc() {
@@ -52,7 +52,7 @@ string GetUserText() {
 }
 
 string GetLoginDesc() {
-    return "{$CP936=切换: use=名字 (或直接写名字) ｜ 新增: add=名字; preset=siliconflow; model=xxx ｜ 删除: del=名字 ｜ 查看: list ｜ 留空 = DeepSeek 官方。密码栏填 API Key。$}";
+    return "{$CP936=切换: use=名字 (或直接写名字) ｜ 新增: add=名字; preset=siliconflow ｜ 删除: del=名字 ｜ 查看: list ｜ 获取可用模型: models ｜ 选模型: model=@序号 ｜ 留空 = DeepSeek 官方。密码栏填 API Key。$}";
 }
 
 string GetPasswordText() {
@@ -61,7 +61,7 @@ string GetPasswordText() {
 
 // ============================================================== Config
 string api_key = "";
-string USER_AGENT = "PotPlayer-DeepSeek-Translate/0.6";
+string USER_AGENT = "PotPlayer-DeepSeek-Translate/0.7";
 
 // 当前生效的自定义 API 配置
 string cfgBase   = "";
@@ -111,6 +111,49 @@ string FIELD_SEP = "\u0002";
 array<string> profName;   // 名字
 array<string> profSpec;   // 配置串（preset=...; model=... 这套）
 array<string> profKey;    // 该 API 自己的 Key
+
+// 从 /v1/models 拉回来的可用模型清单（可选中 model=@序号）
+array<string> modelList;
+string MODEL_FILE = "deepseek_models.txt";   // 写入 PotPlayer 配置目录，便于复制
+
+void LoadModelList() {
+    while (int(modelList.length()) > 0) modelList.removeAt(0);
+    string blob = HostLoadString("model_list", "");
+    if (blob.empty()) return;
+    array<string> items = blob.split(PROF_SEP);
+    int i = 0;
+    int n = int(items.length());
+    while (i < n) {
+        string it = items[i];
+        i++;
+        if (!it.empty()) modelList.insertLast(it);
+    }
+}
+
+void SaveModelList() {
+    string blob = "";
+    int i = 0;
+    int n = int(modelList.length());
+    while (i < n) {
+        if (i > 0) blob += PROF_SEP;
+        blob += modelList[i];
+        i++;
+    }
+    HostSaveString("model_list", blob);
+}
+
+// 只认 1..999。AngelScript 没有文档化的 atoi，但 int→string 有 formatInt，
+// 用它逐个比对即可，不依赖任何未文档化的东西。
+int ParseSmallInt(const string &in s) {
+    string t = s.Trim();
+    if (t.empty()) return -1;
+    int i = 1;
+    while (i <= 999) {
+        if (formatInt(i) == t) return i;
+        i++;
+    }
+    return -1;
+}
 
 void LoadProfiles() {
     while (int(profName.length()) > 0) profName.removeAt(0);
@@ -162,16 +205,16 @@ int FindProfile(const string &in name) {
 }
 
 // 列出全部已保存的 API。会临时切换全局配置，所以先快照再还原。
-string snapB, snapM, snapF, snapA, snapE, snapU;
+string snapB, snapM, snapF, snapA, snapE, snapU, snapK;
 
 void SnapshotCfg() {
     snapB = cfgBase; snapM = cfgModel; snapF = cfgFormat;
-    snapA = cfgAuth; snapE = cfgExtra; snapU = cfgUA;
+    snapA = cfgAuth; snapE = cfgExtra; snapU = cfgUA; snapK = api_key;
 }
 
 void RestoreCfg() {
     cfgBase = snapB; cfgModel = snapM; cfgFormat = snapF;
-    cfgAuth = snapA; cfgExtra = snapE; cfgUA = snapU;
+    cfgAuth = snapA; cfgExtra = snapE; cfgUA = snapU; api_key = snapK;
 }
 
 void ShowProfiles() {
@@ -299,7 +342,19 @@ string ParseAccountSpec(const string &in spec) {
         } else if (kl == "url" || kl == "base" || kl == "endpoint" || kl == "host") {
             cfgBase = v;
         } else if (kl == "model") {
-            cfgModel = v;
+            // model=@3 → 取「获取可用模型」清单里的第 3 个
+            if (v.find("@") == 0) {
+                int pick = ParseSmallInt(v.Right(int(v.length()) - 1));
+                if (pick >= 1 && pick <= int(modelList.length())) {
+                    cfgModel = modelList[pick - 1];
+                    Dbg("model @" + formatInt(pick) + " -> " + cfgModel);
+                } else {
+                    Dbg("model @ 序号超出范围，清单里有 "
+                        + formatInt(int(modelList.length())) + " 个。先填 models");
+                }
+            } else {
+                cfgModel = v;
+            }
         } else if (kl == "format") {
             cfgFormat = v.MakeLower();
         } else if (kl == "auth") {
@@ -375,6 +430,130 @@ string BuildHeaders() {
     return h;
 }
 
+// ================================================ 获取可用模型（/v1/models）
+// 从 cfgBase 推出 models 端点：去掉已补全的部分，补齐版本段，再接 /models
+string ResolveModelsUrl() {
+    string u = cfgBase.Trim();
+    if (u.empty()) u = "https://api.deepseek.com/v1";
+    if (u.find("http") == -1) u = "https://" + u;
+
+    int cut = u.find("/chat/completions");
+    if (cut != -1) u = u.Left(cut);
+    cut = u.find("/messages");
+    if (cut != -1) u = u.Left(cut);
+
+    while (int(u.length()) > 0 && u.Right(1) == "/") {
+        u = u.Left(int(u.length()) - 1);
+    }
+
+    bool hasVersion = false;
+    if (u.find("/v1") != -1) hasVersion = true;
+    if (u.find("/v2") != -1) hasVersion = true;
+    if (u.find("/v3") != -1) hasVersion = true;
+    if (u.find("/v4") != -1) hasVersion = true;
+    if (!hasVersion) u += "/v1";
+
+    return u + "/models";
+}
+
+// 兼容两种常见形状：{"data":[{"id":...}]} 与 {"models":[{"name":...}]}
+int FetchModels() {
+    while (int(modelList.length()) > 0) modelList.removeAt(0);
+
+    string url = ResolveModelsUrl();
+    Dbg("fetching models: " + url);
+
+    HostIncTimeOut(20000);
+    string resp = HostUrlGetString(url, CurrentUA(), BuildHeaders(), "");
+    if (resp.empty()) {
+        Dbg("models: empty response");
+        return 0;
+    }
+
+    JsonReader R;
+    JsonValue Root;
+    if (!R.parse(resp, Root)) {
+        Dbg("models: parse failed, raw=" + resp.Left(200));
+        return 0;
+    }
+
+    JsonValue arr = Root["data"];
+    if (!arr.isArray()) arr = Root["models"];
+    if (!arr.isArray()) {
+        Dbg("models: no data/models array, raw=" + resp.Left(200));
+        return 0;
+    }
+
+    int i = 0;
+    int n = arr.size();
+    while (i < n) {
+        JsonValue it = arr[i];
+        if (it["id"].isString()) modelList.insertLast(it["id"].asString());
+        else if (it["name"].isString()) modelList.insertLast(it["name"].asString());
+        i++;
+    }
+
+    SaveModelList();
+    return int(modelList.length());
+}
+
+// 把清单写进 PotPlayer 配置目录的文本文件 —— 消息框里的字是复制不出来的，
+// 落成文件才能拿去粘贴。
+void SaveModelListFile(const string &in url) {
+    uintptr fp = HostFileCreate(MODEL_FILE);
+    if (fp == 0) {
+        Dbg("models: cannot create file");
+        return;
+    }
+    string txt = "API  : " + url + "\r\n";
+    txt += "数量 : " + formatInt(int(modelList.length())) + "\r\n";
+    txt += "用法 : 在「API 配置」里填 model=@序号\r\n";
+    txt += "----------------------------------------\r\n";
+    int i = 0;
+    int n = int(modelList.length());
+    while (i < n) {
+        txt += formatInt(i + 1) + ". " + modelList[i] + "\r\n";
+        i++;
+    }
+    HostFileWrite(fp, txt);
+    HostFileClose(fp);
+}
+
+void ShowModels() {
+    string url = ResolveModelsUrl();
+    int got = FetchModels();
+
+    if (got == 0) {
+        HostMessageBox("没能取到模型列表。\n\n地址: " + url
+                       + "\n\n可能原因：\n"
+                       + "  · 该服务不提供 GET /v1/models\n"
+                       + "  · Key 无效或没权限\n"
+                       + "  · 本地服务没启动\n\n"
+                       + "也可以直接把模型名手写进配置，例如：\n"
+                       + "  add=work; preset=ollama; model=qwen2.5:7b",
+                       "DeepSeek Translate - 获取可用模型", 2, 0);
+        return;
+    }
+
+    SaveModelListFile(url);
+
+    string msg = "共取到 " + formatInt(got) + " 个模型：\n\n";
+    int i = 0;
+    int shown = 0;
+    while (i < got && shown < 25) {
+        msg += "  " + formatInt(i + 1) + ". " + modelList[i] + "\n";
+        i++;
+        shown++;
+    }
+    if (got > shown) msg += "  ...（其余见下方文件）\n";
+    msg += "\n完整列表已写到：\n" + HostGetConfigFolder() + "\\" + MODEL_FILE;
+    msg += "\n\n选中某个：在「API 配置」里填\n";
+    msg += "  model=@序号\n";
+    msg += "例如  model=@" + formatInt(shown > 0 ? 1 : 0);
+
+    HostMessageBox(msg, "DeepSeek Translate - 可用模型", 2, 0);
+}
+
 // ============================================ 处理「账户名称」字段的全部写法
 string pickKey(const string &in passKey) {
     if (!specKey.empty()) return specKey;
@@ -413,6 +592,24 @@ void HandleAccountSpec(const string &in spec, const string &in passKey, bool sho
     if (low == "list" || low == "?" || low == "help") {
         if (showUi) ShowProfiles();
         return;                     // 保持当前配置不变
+    }
+
+    // ---- models 或 models=名字 → 拉取可用模型 ----
+    if (low == "models" || low.find("models=") == 0) {
+        if (!showUi) return;        // 启动时不联网拉清单
+
+        SnapshotCfg();
+        if (int(s.length()) > 7) {
+            string target = s.Right(int(s.length()) - 7).Trim();
+            int pi = FindProfile(target);
+            if (pi >= 0) {
+                ParseAccountSpec(profSpec[pi]);
+                if (!profKey[pi].empty()) api_key = profKey[pi];
+            }
+        }
+        ShowModels();
+        RestoreCfg();
+        return;
     }
 
     // ---- del=名字 ----
@@ -855,9 +1052,10 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
 void OnInitialize() {
     if (DEBUG_LOG) HostOpenConsole();
 
-    HostPrintUTF8("{$CP0=DeepSeek translation plugin loaded.$} (v0.6)\n");
+    HostPrintUTF8("{$CP0=DeepSeek translation plugin loaded.$} (v0.7)\n");
 
     LoadProfiles();
+    LoadModelList();
 
     api_key  = HostLoadString("api_key", "");
     acctSpec = HostLoadString("account_spec", "");

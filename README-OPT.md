@@ -176,6 +176,53 @@ v0.4 改用固定的 3 条上限，不再依赖 token 估算，从根上绕开�
 
 **Key 的更新**：切到某个 API 时如果在密码栏输了新 Key，会自动写回该 API（方便换 Key）。
 
+### 获取可用模型（v0.7）
+
+PotPlayer 只给两个输入框、做不出下拉列表，所以「获取可用模型」是这样实现的：
+
+```
+账户名称: models            ← 拉取当前 API 的 /v1/models
+账户名称: models=work       ← 拉取已保存的 API「work」的模型
+```
+
+会做三件事：
+
+1. **弹窗列出**取到的模型（最多显示 25 个，带序号）
+2. **写一份完整清单**到 PotPlayer 配置目录的 `deepseek_models.txt`
+   —— 消息框里的文字是复制不出来的，落成文件才能拿去粘贴
+3. 清单会缓存下来，之后可以直接用序号选：
+
+```
+账户名称: add=work; preset=siliconflow; model=@3
+```
+
+`model=@3` 就是清单里的第 3 个模型，不用手打完整 ID。
+
+配好的消息框长这样：
+
+```
+共取到 47 个模型：
+
+  1. deepseek-chat
+  2. deepseek-reasoner
+  3. Qwen/Qwen2.5-7B-Instruct
+  ...
+
+完整列表已写到：
+C:\Users\...\PotPlayerMini64\deepseek_models.txt
+```
+
+**端点推导**：从 API 地址推出 `/v1/models`，会先剥掉 `/chat/completions` 或 `/messages`，
+再按需补版本段。所以智谱 `/api/paas/v4`、Gemini `/v1beta/openai`、Anthropic 都能正确推导
+（8 组用例都有断言覆盖）。
+
+**两种响应形状都认**：`{"data":[{"id":...}]}`（OpenAI / DeepSeek / 硅基流动 / 智谱）
+和 `{"models":[{"name":...}]}`（Ollama 原生）。
+
+**取不到时**会明确告诉你去哪看、可能是什么原因（服务不提供 `/v1/models`、Key 没权限、
+本地服务没启动），并提示可以手写模型名。
+
+
 ### 存储方式
 
 用 `HostSaveString("profiles", ...)` 保存 —— 与 `api_key` 完全相同的机制，
@@ -450,7 +497,7 @@ python -m py_compile installer.py
 用 `--check` 打印的 SHA256 与下面比对，即可确认 exe 内嵌的正是本分支的 v0.5 脚本：
 
 ```
-1b175900bc5bbf1c4e2f7f6968a7828f902f03910d12b83f04d35c7f21751da6  SubtitleTranslate - DeepSeek.as
+8377525152f9ab08401ef2fbcf7d280939bc98e18180c62d8253aa79a39f3d12  SubtitleTranslate - DeepSeek.as
 2cef8f8a8b0d8fc9beaf954ec49a9c19952dff9eb5f0f753f8f54ec02d41ed89  SubtitleTranslate - DeepSeek.ico
 ```
 

@@ -616,6 +616,133 @@ def check_profiles() -> bool:
     return ok
 
 
+def resolve_models_url(cfg: Cfg) -> str:
+    """复刻 ResolveModelsUrl()"""
+    u = (cfg.base or "https://api.deepseek.com/v1").strip()
+    if "http" not in u:
+        u = "https://" + u
+    for suffix in ("/chat/completions", "/messages"):
+        cut = u.find(suffix)
+        if cut != -1:
+            u = u[:cut]
+    while u and u.endswith("/"):
+        u = u[:-1]
+    if not any(v in u for v in ("/v1", "/v2", "/v3", "/v4")):
+        u += "/v1"
+    return u + "/models"
+
+
+def parse_small_int(s: str):
+    """复刻 ParseSmallInt()：只认 1..999"""
+    t = s.strip()
+    if not t:
+        return -1
+    for i in range(1, 1000):
+        if str(i) == t:
+            return i
+    return -1
+
+
+def parse_models_payload(root):
+    """复刻 FetchModels() 的两形状兼容：data[].id 与 models[].id/name"""
+    arr = root.get("data")
+    if not isinstance(arr, list):
+        arr = root.get("models")
+    if not isinstance(arr, list):
+        return []
+    out = []
+    for it in arr:
+        if isinstance(it, dict):
+            if isinstance(it.get("id"), str):
+                out.append(it["id"])
+            elif isinstance(it.get("name"), str):
+                out.append(it["name"])
+    return out
+
+
+def check_models() -> bool:
+    print("  [可用模型获取]")
+    ok = True
+
+    # 1. models 端点推导
+    cases = [
+        ("deepseek 官方", "", "https://api.deepseek.com/v1/models"),
+        ("preset=ollama", "preset=ollama", "http://localhost:11434/v1/models"),
+        ("preset=zhipu（/v4 不加 /v1）", "preset=zhipu",
+         "https://open.bigmodel.cn/api/paas/v4/models"),
+        ("preset=gemini", "preset=gemini",
+         "https://generativelanguage.googleapis.com/v1beta/openai/models"),
+        ("preset=anthropic（去掉 /messages）", "preset=anthropic",
+         "https://api.anthropic.com/v1/models"),
+        ("已写完整对话路径要能剥掉", "https://x.com/v1/chat/completions",
+         "https://x.com/v1/models"),
+        ("裸域名", "my-gw.com", "https://my-gw.com/v1/models"),
+        ("末尾带斜杠", "https://y.com/v1/", "https://y.com/v1/models"),
+    ]
+    for label, spec, want in cases:
+        cfg = Cfg()
+        parse_account_spec_full(cfg, spec)
+        got = resolve_models_url(cfg)
+        if got != want:
+            print(f"    [FAIL] {label}: 期望 {want} 实得 {got}")
+            ok = False
+        else:
+            print(f"    [OK]   {label} -> {got}")
+
+    # 2. 响应体两形状兼容
+    shapes = [
+        ("OpenAI 形状", {"object": "list", "data": [
+            {"id": "deepseek-chat"}, {"id": "deepseek-reasoner"}]},
+         ["deepseek-chat", "deepseek-reasoner"]),
+        ("Ollama 形状", {"models": [{"name": "qwen2.5:7b"}, {"name": "llama3:8b"}]},
+         ["qwen2.5:7b", "llama3:8b"]),
+        ("混合/缺字段", {"data": [{"id": "a"}, {"nope": 1}, {"id": "b"}]}, ["a", "b"]),
+        ("没有数组", {"error": {"message": "nope"}}, []),
+    ]
+    for label, payload, want in shapes:
+        got = parse_models_payload(payload)
+        if got != want:
+            print(f"    [FAIL] {label}: 期望 {want} 实得 {got}")
+            ok = False
+        else:
+            print(f"    [OK]   {label} -> {got}")
+
+    # 3. 序号解析
+    for text, want in [("1", 1), ("12", 12), ("999", 999), ("0", -1), ("1000", -1), ("", -1)]:
+        got = parse_small_int(text)
+        if got != want:
+            print(f"    [FAIL] ParseSmallInt('{text}') 期望 {want} 实得 {got}")
+            ok = False
+    print("    [OK]   序号解析 1..999 行为正确")
+
+    # 4. model=@N 取值
+    cfg = Cfg()
+    apply_preset(cfg, "siliconflow")
+    model_list = ["deepseek-ai/DeepSeek-V3", "Qwen/Qwen2.5-7B-Instruct", "glm-4-flash"]
+    for spec, want in [("model=@1", "deepseek-ai/DeepSeek-V3"),
+                       ("model=@3", "glm-4-flash"),
+                       ("model=@9", "Qwen/Qwen2.5-7B-Instruct"),   # 越界 → 保持预设模型
+                       ("model=Qwen/Qwen2.5-32B", "Qwen/Qwen2.5-32B")]:
+        cfg2 = Cfg()
+        apply_preset(cfg2, "siliconflow")
+        for tok in spec.split(";"):
+            k, _, v = tok.partition("=")
+            if k.strip() == "model":
+                if v.startswith("@"):
+                    pick = parse_small_int(v[1:])
+                    if 1 <= pick <= len(model_list):
+                        cfg2.model = model_list[pick - 1]
+                else:
+                    cfg2.model = v
+        if cfg2.model != want:
+            print(f"    [FAIL] {spec}: 期望 {want} 实得 {cfg2.model}")
+            ok = False
+        else:
+            print(f"    [OK]   {spec} -> {cfg2.model}")
+
+    return ok
+
+
 def check_json() -> bool:
     ok = True
     print("  [OpenAI 兼容格式]")
@@ -728,6 +855,7 @@ if __name__ == "__main__":
     print("3) 复刻逻辑验证")
     b = check_config()
     b = check_profiles() and b
+    b = check_models() and b
     b = check_json() and b
     print("4) 对照 PotPlayer 官方 API 文档 (api.txt)")
     c = check_api()
