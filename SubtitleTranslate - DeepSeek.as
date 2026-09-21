@@ -46,11 +46,13 @@
 
 // ============================================================ Plugin info
 string GetTitle() {
+    // 由管理器生成的多条目插件里，用各自的名字显示在 PotPlayer 列表中
+    if (!BAKED_NAME.empty()) return BAKED_NAME;
     return "{$CP0=DeepSeek Translate$}";
 }
 
 string GetVersion() {
-    return "1.0";
+    return "1.1";
 }
 
 string GetDesc() {
@@ -77,6 +79,14 @@ string GetPasswordText() {
 // ============================================================== Config
 string api_key = "";
 string USER_AGENT = "PotPlayer-DeepSeek-Translate/0.7";
+
+// ==== BAKED CONFIG BEGIN ====
+// 这一段由「API 管理器」生成插件条目时写入，手改会被下次生成覆盖。
+// 留空 = 走配置文件 / 界面里的账户设置（默认行为）。
+string BAKED_NAME    = "";
+string BAKED_ACCOUNT = "";
+string BAKED_KEY     = "";
+// ==== BAKED CONFIG END ====
 
 // 当前生效的自定义 API 配置
 string cfgBase   = "";
@@ -1275,7 +1285,13 @@ void OnInitialize() {
 
     // 文本配置通道优先：所见即所跑，不必去界面里找那个隐蔽的账户入口
     HostPrintUTF8("{$CP0=config file: $}" + ConfigFilePath() + "\n");
-    if (LoadConfigFile()) {
+
+    // 优先级：管理器烘焙进本文件的配置 > 文本配置文件 > 界面上保存的账户设置
+    if (!BAKED_ACCOUNT.empty() || !BAKED_KEY.empty()) {
+        acctSpec = BAKED_ACCOUNT;
+        if (!BAKED_KEY.empty()) api_key = BAKED_KEY;
+        HostPrintUTF8("{$CP0=config source: baked-in (generated entry)$}\n");
+    } else if (LoadConfigFile()) {
         string fa = fileAcct.Trim();
         string fl = fa.MakeLower();
         if (fl == "models" || fl == "list" || fl == "help" || fa.empty()) {

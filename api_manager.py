@@ -597,6 +597,140 @@ def auto_adapt(api, log=None):
     return a, log
 
 
+# ================================== 生成「每个 API 一个插件条目」
+BAKED_BEGIN = "// ==== BAKED CONFIG BEGIN ===="
+BAKED_END = "// ==== BAKED CONFIG END ===="
+
+# 主插件在 Translate 目录里的文件名
+MAIN_PLUGIN = "SubtitleTranslate - DeepSeek.as"
+MAIN_ICON = "SubtitleTranslate - DeepSeek.ico"
+ENTRY_PREFIX = "SubtitleTranslate - DeepSeek"
+
+
+def plugin_dir():
+    """PotPlayer 的翻译插件目录（可能存在多个候选）"""
+    cands = [
+        r"C:\Program Files\DAUM\PotPlayer\Extension\Subtitle\Translate",
+        r"C:\Program Files (x86)\DAUM\PotPlayer\Extension\Subtitle\Translate",
+    ]
+    for d in cands:
+        if os.path.isdir(d):
+            return d
+    return cands[0]
+
+
+def safe_name(name):
+    """把 API 名字变成可做文件名的片段"""
+    bad = '<>:"/\\|?*'
+    out = "".join("_" if c in bad else c for c in (name or "").strip())
+    out = out.strip(" .")
+    return out or "api"
+
+
+def make_entry_source(template, api):
+    """把模板里的烘焙段换成这条 API 的配置"""
+    i = template.find(BAKED_BEGIN)
+    j = template.find(BAKED_END)
+    if i == -1 or j == -1:
+        raise ValueError("主插件里找不到 BAKED CONFIG 标记段")
+    j += len(BAKED_END)
+
+    def esc(s):
+        return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+    block = (
+        BAKED_BEGIN + "\n"
+        "// 由「API 管理器」生成 —— 本文件对应一个 PotPlayer 插件条目\n"
+        "// 想改配置请回管理器改，再重新生成；手改会被覆盖。\n"
+        f'string BAKED_NAME    = "{esc(api.get("name"))}";\n'
+        f'string BAKED_ACCOUNT = "{esc(build_account_spec(api))}";\n'
+        f'string BAKED_KEY     = "{esc(api.get("key"))}";\n'
+        + BAKED_END
+    )
+    return template[:i] + block + template[j:]
+
+
+def plan_entries(store, src_dir=None):
+    """返回 [(文件名, 内容或None表示复制ico, 源路径)]，不落盘，便于先预览/测试"""
+    d = src_dir or plugin_dir()
+    tpl_path = os.path.join(d, MAIN_PLUGIN)
+    if not os.path.isfile(tpl_path):
+        return [], f"找不到主插件模板：{tpl_path}"
+    with open(tpl_path, "r", encoding="utf-8") as fh:
+        template = fh.read()
+
+    plan = []
+    used = set()
+    for api in store.get("apis", []):
+        base = f"{ENTRY_PREFIX} ({safe_name(api.get('name'))}).as"
+        n = base
+        k = 2
+        while n.lower() in used:
+            n = base[:-4] + f" {k}.as"
+            k += 1
+        used.add(n.lower())
+        plan.append((n, make_entry_source(template, api)))
+    return plan, ""
+
+
+def generate_entries(store, target_dir=None, src_dir=None):
+    """真正写盘。返回 (写出的文件列表, 错误信息)"""
+    d = target_dir or plugin_dir()
+    plan, err = plan_entries(store, src_dir or d)
+    if err:
+        return [], err
+    if not os.path.isdir(d):
+        return [], f"目录不存在：{d}"
+    written = []
+    # 附带的图标（照着主插件的 ico 复制一份同名副本，让列表有条目图标）
+    ico_src = os.path.join(src_dir or d, MAIN_ICON)
+    for fname, content in plan:
+        p = os.path.join(d, fname)
+        try:
+            with open(p, "w", encoding="utf-8", newline="\r\n") as fh:
+                fh.write(content)
+        except OSError as exc:
+            return written, f"写入 {fname} 失败：{exc}"
+        written.append(fname)
+        if os.path.isfile(ico_src):
+            ico_dst = os.path.join(d, fname[:-4] + ".ico")
+            try:
+                import shutil
+                shutil.copyfile(ico_src, ico_dst)
+            except OSError:
+                pass
+    return written, ""
+
+
+def plugin_dir_writable(d=None):
+    d = d or plugin_dir()
+    if not os.path.isdir(d):
+        return False
+    probe = os.path.join(d, "~wtest.tmp")
+    try:
+        with open(probe, "w") as fh:
+            fh.write("x")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def elevate_self(args):
+    """以管理员身份重新启动自己（Windows UAC）"""
+    try:
+        import ctypes
+        exe = sys.executable
+        if getattr(sys, "frozen", False):
+            params = " ".join(args)
+        else:
+            params = " ".join([os.path.abspath(__file__)] + args)
+        r = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
+        return r > 32
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def ping(api, timeout=30):
     """发一次最小翻译请求，返回 (是否成功, 说明)"""
     chat, _ = resolve_urls(api.get("url", ""), api.get("format", "openai"))
@@ -839,9 +973,11 @@ def run_gui(auto_close_ms=None):
                command=lambda: on_autoadapt()).pack(side="left")
     ttk.Button(act, text="② 设为当前并写入插件",
                command=lambda: on_activate()).pack(side="left", padx=6)
-    ttk.Button(act, text="保存", command=lambda: on_save()).pack(side="left")
-    ttk.Button(act, text="打开配置文件位置",
-               command=lambda: on_open()).pack(side="left", padx=6)
+    ttk.Button(act, text="③ 生成列表条目",
+               command=lambda: on_generate()).pack(side="left")
+    ttk.Button(act, text="保存", command=lambda: on_save()).pack(side="left", padx=6)
+    ttk.Button(act, text="打开配置位置",
+               command=lambda: on_open()).pack(side="left")
 
     tk.Label(root, textvariable=status, anchor="w",
              relief="sunken").pack(side="bottom", fill="x")
@@ -1003,6 +1139,46 @@ def run_gui(auto_close_ms=None):
         messagebox.showinfo("完成",
                             f"已把「{a.get('name')}」写入：\n{p}\n\n"
                             "重启 PotPlayer 即可生效。")
+
+    def on_generate():
+        """为每条 API 生成一个 PotPlayer 插件条目，让它出现在「翻译引擎」列表里"""
+        store_snapshot = load_store()
+        if not store_snapshot.get("apis"):
+            messagebox.showwarning("没有 API", "先在左边新建至少一条 API")
+            return
+        d = plugin_dir()
+        plan, err = plan_entries(store_snapshot, d)
+        if err:
+            messagebox.showerror("无法生成", err + f"\n\n插件目录：{d}")
+            return
+
+        names = "\n".join("  · " + n for n, _ in plan)
+        if not plugin_dir_writable(d):
+            if not messagebox.askyesno(
+                    "需要管理员权限",
+                    f"插件目录不可写：\n{d}\n\n"
+                    f"将生成 {len(plan)} 个条目：\n{names}\n\n"
+                    "现在用管理员权限重启本程序来完成写入？\n"
+                    "（会弹一次 UAC）"):
+                return
+            if not elevate_self(["--generate"]):
+                messagebox.showerror("提权失败", "UAC 被拒绝，或无法启动管理员进程")
+                return
+            status.set("已请求管理员权限写入，请在 UAC 弹窗点「是」")
+            return
+
+        written, err2 = generate_entries(store_snapshot, d)
+        if err2:
+            messagebox.showerror("写入失败", err2)
+            return
+        status.set(f"已生成 {len(written)} 个插件条目")
+        messagebox.showinfo(
+            "生成完成",
+            f"已写入 {len(written)} 个条目到：\n{d}\n\n"
+            + "\n".join("  · " + w for w in written)
+            + "\n\n重启 PotPlayer 后，这些名字会出现在\n"
+              "「字幕 → 实时字幕翻译 → 翻译引擎」下拉列表里，\n"
+              "直接选即可切换 API。")
 
     def on_open():
         d = config_dir()
@@ -1314,10 +1490,39 @@ def main():
     if "--print" in sys.argv:
         print("store      :", store_path())
         print("plugin cfg :", plugin_cfg_path())
+        print("plugin dir :", plugin_dir(), "(可写)" if plugin_dir_writable() else "(不可写)")
         st = load_store()
         print(f"APIs       : {len(st['apis'])}  当前: {st.get('active') or '(无)'}")
         for x in st["apis"]:
             print(f"  - {x['name']}: {x['model']} @ {x['url']}")
+        return 0
+    if "--generate" in sys.argv:
+        # 由提权后的实例调用：只写文件，不弹 GUI
+        st = load_store()
+        written, err = generate_entries(st)
+        log = os.path.join(config_dir(), "api_manager_generate.log")
+        try:
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write(f"plugin dir: {plugin_dir()}\n")
+                fh.write("err: " + (err or "(none)") + "\n")
+                fh.write("written:\n" + "\n".join(written) + "\n")
+        except OSError:
+            pass
+        if err:
+            try:
+                import tkinter.messagebox as mb
+                mb.showerror(APP_TITLE, err)
+            except Exception:
+                pass
+            return 1
+        try:
+            import tkinter.messagebox as mb
+            mb.showinfo(APP_TITLE,
+                        f"已生成 {len(written)} 个插件条目：\n\n"
+                        + "\n".join("  · " + w for w in written)
+                        + "\n\n重启 PotPlayer 后即可在「翻译引擎」下拉里看到。")
+        except Exception:
+            pass
         return 0
     try:
         return run_gui(auto_close_ms=1200 if "--guitest" in sys.argv else None)
