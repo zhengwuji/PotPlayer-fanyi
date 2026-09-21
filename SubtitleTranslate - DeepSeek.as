@@ -106,15 +106,31 @@ int    activeProfile = -1;  // 当前使用的已保存 API 序号，-1 = 一次
 int maxRetries = 3;
 int baseRetryDelay = 1000;
 
-bool DEBUG_LOG = false;
+string LOG_FILE = "deepseek_translate.log";
+bool DEBUG_LOG = true;
+bool DEBUG_CONSOLE = true;
 
 int MAX_CTX_SENTENCES = 3;
 int MAX_CTX_BYTES     = 600;
 int MAX_OUTPUT_CHARS  = 200;
 int CACHE_SIZE        = 32;
 
+void LogDebug(const string &in m) {
+    if (!DEBUG_LOG) return;
+    if (DEBUG_CONSOLE) {
+        HostOpenConsole();
+        HostPrintUTF8("[DeepSeekLog] " + m + "\n");
+    }
+    uintptr fp = HostFileCreate(LOG_FILE);
+    if (fp != 0) {
+        HostFileSeek(fp, 0, 2);
+        HostFileWrite(fp, "[" + formatInt(HostGetTickCount()) + "ms] " + m + "\r\n");
+        HostFileClose(fp);
+    }
+}
+
 void Dbg(const string &in m) {
-    if (DEBUG_LOG) HostPrintUTF8("[DeepSeek] " + m + "\n");
+    LogDebug(m);
 }
 
 // api.txt 第 33-44 行：长等待会被判脚本超时，
@@ -752,7 +768,11 @@ void ShowModels() {
 // ============================================ 处理「账户名称」字段的全部写法
 string pickKey(const string &in passKey) {
     if (!specKey.empty()) return specKey;
-    return passKey.Trim();
+    string pk = passKey.Trim();
+    if (!pk.empty()) return pk;
+    if (!BAKED_KEY.empty()) return BAKED_KEY;
+    if (!fileKey.empty()) return fileKey;
+    return "";
 }
 
 void ActivateProfile(int idx, const string &in passKey, bool rememberKey) {
@@ -775,10 +795,18 @@ void ActivateProfile(int idx, const string &in passKey, bool rememberKey) {
 void HandleAccountSpec(const string &in spec, const string &in passKey, bool showUi) {
     string s = spec.Trim();
     if (s.empty()) {
-        ParseAccountSpec("");
+        if (!BAKED_ACCOUNT.empty()) {
+            ParseAccountSpec(BAKED_ACCOUNT);
+        } else if (!fileAcct.empty()) {
+            ParseAccountSpec(fileAcct);
+        } else {
+            ParseAccountSpec("");
+        }
         activeProfile = -1;
         api_key = pickKey(passKey);
-        HostSaveString("account_spec", "");
+        if (BAKED_ACCOUNT.empty() && BAKED_KEY.empty()) {
+            HostSaveString("account_spec", "");
+        }
         return;
     }
 
@@ -901,21 +929,27 @@ void HandleAccountSpec(const string &in spec, const string &in passKey, bool sho
     ParseAccountSpec(s);
     activeProfile = -1;
     api_key = pickKey(passKey);
-    HostSaveString("account_spec", s);
+    if (BAKED_ACCOUNT.empty() && BAKED_KEY.empty()) {
+        HostSaveString("account_spec", s);
+    }
 }
 
 // ============================================================ Login / logout
 string ServerLogin(string User, string Pass) {
+    LogDebug("ServerLogin() called: User='" + User + "', Pass length=" + formatInt(int(Pass.length())));
+    EnsureInitialized();
     Pass = Pass.Trim();
     LoadProfiles();
     HandleAccountSpec(User, Pass, true);
 
     if (api_key.empty() && cfgAuth != "none") {
+        LogDebug("ServerLogin: failed, API Key is empty");
         HostPrintUTF8("{$CP0=API Key not configured.$}\n");
         return "fail: API Key is empty";
     }
 
     HostSaveString("api_key", api_key);
+    LogDebug("ServerLogin: 200 ok, endpoint=" + ResolveUrl() + ", model=" + cfgModel);
     HostPrintUTF8("{$CP0=Configured.$}\n");
     HostPrintUTF8("  endpoint: " + ResolveUrl() + "\n");
     HostPrintUTF8("  model   : " + cfgModel + "\n");
@@ -924,6 +958,7 @@ string ServerLogin(string User, string Pass) {
 }
 
 void ServerLogout() {
+    LogDebug("ServerLogout() called");
     api_key = "";
     HostPrintUTF8("{$CP0=Logged out.$}\n");
 }
@@ -1141,16 +1176,94 @@ bool IsPermanentError(const string &in msg) {
     return false;
 }
 
+// ============================================================== Lazy Initialization
+bool g_initialized = false;
+
+void EnsureInitialized() {
+    if (g_initialized) return;
+    g_initialized = true;
+
+    LogDebug("=== EnsureInitialized() START ===");
+    LogDebug("Plugin: " + GetTitle());
+    LogDebug("BAKED_NAME: '" + BAKED_NAME + "'");
+    LogDebug("BAKED_ACCOUNT: '" + BAKED_ACCOUNT + "'");
+    LogDebug("BAKED_KEY length: " + formatInt(int(BAKED_KEY.length())));
+
+    LoadProfiles();
+    LoadModelList();
+
+    // 1. 优先级最高：API 管理器烘焙进本文件的独立条目配置
+    if (!BAKED_ACCOUNT.empty() || !BAKED_KEY.empty()) {
+        acctSpec = BAKED_ACCOUNT;
+        if (!BAKED_KEY.empty()) api_key = BAKED_KEY;
+        LogDebug("Config source: BAKED (generated entry)");
+        HostPrintUTF8("{$CP0=config source: baked-in (generated entry)$}\n");
+    } else if (LoadConfigFile()) {
+        // 2. 其次：文本配置通道 deepseek_api.txt
+        string fa = fileAcct.Trim();
+        string fl = fa.MakeLower();
+        if (fl == "models" || fl == "list" || fl == "help" || fa.empty()) {
+            LogDebug("Config file: '" + fa + "' is a UI command, fallback to saved settings");
+            HostPrintUTF8("config file: '" + fa + "' is a UI command, using saved settings\n");
+            api_key  = HostLoadString("api_key", "");
+            acctSpec = HostLoadString("account_spec", "");
+        } else {
+            acctSpec = fa;
+            if (!fileKey.empty()) api_key = fileKey;
+            LogDebug("Config source: file " + cfgUsedPath);
+            HostPrintUTF8("{$CP0=config source: $}" + cfgUsedPath + "\n");
+        }
+    } else {
+        // 3. 最后：界面上保存的账户设置
+        api_key  = HostLoadString("api_key", "");
+        acctSpec = HostLoadString("account_spec", "");
+        LogDebug("Config source: saved UI settings");
+    }
+
+    LogDebug("Before HandleAccountSpec: acctSpec='" + acctSpec + "', api_key length=" + formatInt(int(api_key.length())));
+    // 初始化阶段不弹窗，避免每次启动都跳消息框
+    HandleAccountSpec(acctSpec, api_key, false);
+
+    // 终极保底：如果 BAKED_KEY / fileKey 存在但 api_key 依然为空，恢复它
+    if (api_key.empty()) {
+        if (!BAKED_KEY.empty()) {
+            api_key = BAKED_KEY;
+            LogDebug("Fallback: restored api_key from BAKED_KEY");
+        } else if (!fileKey.empty()) {
+            api_key = fileKey;
+            LogDebug("Fallback: restored api_key from fileKey");
+        }
+    }
+
+    LogDebug("After HandleAccountSpec: endpoint=" + ResolveUrl());
+    LogDebug("model=" + cfgModel + ", format=" + cfgFormat + ", auth=" + cfgAuth);
+    LogDebug("Final api_key length=" + formatInt(int(api_key.length())));
+    LogDebug("profiles=" + formatInt(int(profName.length())) + ", active=" + formatInt(activeProfile));
+    LogDebug("=== EnsureInitialized() END ===");
+}
+
 // ============================================================== Translate
 string Translate(string Text, string &in SrcLang, string &in DstLang) {
+    LogDebug("=== Translate() START ===");
+    LogDebug("Text: '" + Text.Left(60) + "'");
+    LogDebug("SrcLang: '" + SrcLang + "', DstLang: '" + DstLang + "'");
+
+    EnsureInitialized();
+
     if (api_key.empty() && cfgAuth != "none") {
+        LogDebug("[ERROR] api_key is EMPTY (cfgAuth=" + cfgAuth + ")!");
         HostPrintUTF8("{$CP0=API Key not configured. Please enter it in the settings menu.$}\n");
-        return "[未配置 API Key]";
+        SrcLang = "UTF8";
+        DstLang = "UTF8";
+        return "[未配置 API Key: 请在API管理器中输入Key并重新生成]";
     }
 
     if (DstLang.empty() || DstLang == "{$CP0=Auto Detect$}") {
+        LogDebug("[ERROR] Target language not specified: '" + DstLang + "'");
         HostPrintUTF8("{$CP0=Target language not specified. Please select a target language.$}\n");
-        return "[未选择目标语言]";
+        SrcLang = "UTF8";
+        DstLang = "UTF8";
+        return "[未选择目标语言: 请在PotPlayer右下角选择目标语言]";
     }
 
     if (SrcLang.empty() || SrcLang == "{$CP0=Auto Detect$}") SrcLang = "";
@@ -1158,7 +1271,7 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
     string ck = DstLang + "||" + SrcLang + "||" + Text;
     string cached = CacheGet(ck);
     if (!cached.empty()) {
-        Dbg("cache hit");
+        LogDebug("Cache hit, returning cached translation");
         SrcLang = "UTF8";
         DstLang = "UTF8";
         return cached;
@@ -1168,18 +1281,20 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
     string body = BuildRequest(Text, SrcLang, DstLang);
     string headers = BuildHeaders();
 
+    LogDebug("Request URL: " + url);
+    LogDebug("Request Headers: " + headers);
+    LogDebug("Request Body length: " + formatInt(int(body.length())) + " bytes");
+
     int retryCount = 0;
     int delay = baseRetryDelay;
 
     while (retryCount < maxRetries) {
-        // 注意：int 必须走 formatInt，AngelScript 不会把数字隐式拼进字符串
-        Dbg("attempt " + formatInt(retryCount) + ", model=" + cfgModel
-            + ", body=" + formatInt(int(body.length())) + " bytes");
-
+        LogDebug("HTTP request attempt #" + formatInt(retryCount + 1) + " / " + formatInt(maxRetries) + "...");
         HostIncTimeOut(20000);
         string response = HostUrlGetString(url, CurrentUA(), headers, body);
 
         if (response.empty()) {
+            LogDebug("[WARN] HTTP request returned empty (network timeout or connection failed)");
             HostPrintUTF8("{$CP0=Translation request failed. Retrying...$}\n");
             retryCount++;
             if (retryCount < maxRetries) {
@@ -1189,11 +1304,14 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
             continue;
         }
 
+        LogDebug("HTTP response length: " + formatInt(int(response.length())) + " bytes");
+        LogDebug("HTTP response preview: " + response.Left(300));
+
         JsonReader Reader;
         JsonValue Root;
         if (!Reader.parse(response, Root)) {
+            LogDebug("[WARN] JSON parse failed, response: " + response.Left(200));
             HostPrintUTF8("{$CP0=Failed to parse API response. Retrying...$}\n");
-            Dbg("raw: " + response.Left(300));
             retryCount++;
             if (retryCount < maxRetries) {
                 BackoffSleep(delay);
@@ -1206,13 +1324,13 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
         string extracted = "";
         if (cfgFormat == "anthropic") {
             JsonValue c = Root["content"];
-            if (c.isArray() && c[0]["text"].isString()) {
+            if (c.isArray() && c.size() > 0 && c[0]["text"].isString()) {
                 extracted = c[0]["text"].asString();
                 gotIt = true;
             }
         } else {
             JsonValue choices = Root["choices"];
-            if (choices.isArray() && choices[0]["message"]["content"].isString()) {
+            if (choices.isArray() && choices.size() > 0 && choices[0]["message"]["content"].isString()) {
                 extracted = choices[0]["message"]["content"].asString();
                 gotIt = true;
             }
@@ -1223,7 +1341,7 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
             if (!translated.empty()) {
                 RememberPair(Text, translated);
                 CachePut(ck, translated);
-                Dbg("ok: " + translated);
+                LogDebug("[SUCCESS] Translated: " + translated);
                 SrcLang = "UTF8";
                 DstLang = "UTF8";
                 return translated;
@@ -1232,32 +1350,37 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
 
         if (Root["error"]["message"].isString()) {
             string errorMessage = Root["error"]["message"].asString();
+            LogDebug("[ERROR] API returned error message: " + errorMessage);
             HostPrintUTF8("{$CP0=API Error: $}" + errorMessage + "\n");
             if (IsPermanentError(errorMessage)) {
+                LogDebug("[ERROR] Permanent error, aborting this line.");
                 HostPrintUTF8("{$CP0=Permanent error, giving up on this line.$}\n");
-                return "[翻译服务报错]";
+                SrcLang = "UTF8";
+                DstLang = "UTF8";
+                return "[翻译服务报错: " + errorMessage + "]";
             }
         } else if (Root["error"].isObject()) {
-            // 有些服务的 error.message 不是字符串，而是结构化校验错误
-            // （例如模型名非法时返回的 Pydantic 列表）。这类基本是请求本身的问题，
-            // 重试不会变好，直接放弃并原样打出来便于定位。
+            LogDebug("[ERROR] API returned structured error: " + response.Left(400));
             HostPrintUTF8("{$CP0=API returned a structured error (not a plain message).$}\n");
             HostPrintUTF8("  " + response.Left(400) + "\n");
-            return "[翻译服务报错]";
+            SrcLang = "UTF8";
+            DstLang = "UTF8";
+            return "[翻译服务报错: " + response.Left(100) + "]";
         } else if (!gotIt) {
-            // 没有报错、也没有内容 —— 多半是推理模型把 max_tokens 全用在 reasoning 上，
-            // content 返回 null。实测 mercury-2.5 在 max_tokens=256 时必然如此。
             JsonValue rt = Root["usage"]["completion_tokens_details"]["reasoning_tokens"];
             if (rt.isInt() || rt.isUInt()) {
+                LogDebug("[ERROR] Empty content: reasoning tokens exhausted max_tokens");
                 HostPrintUTF8("{$CP0=Empty content: the model spent the whole token budget on reasoning.$}\n");
                 HostPrintUTF8("  hint: add  body=\"reasoning_effort\":\"none\"  or raise  maxtok=1024\n");
-                return "[推理占满额度]";
+                SrcLang = "UTF8";
+                DstLang = "UTF8";
+                return "[推理占满额度: 请在配置中添加 body=\"reasoning_effort\":\"none\"]";
             }
+            LogDebug("[WARN] Empty translation content, retrying...");
             HostPrintUTF8("{$CP0=Translation failed. Retrying...$}\n");
-            Dbg("raw: " + response.Left(300));
         } else {
+            LogDebug("[WARN] Translation finalized to empty, retrying...");
             HostPrintUTF8("{$CP0=Translation failed. Retrying...$}\n");
-            Dbg("raw: " + response.Left(300));
         }
 
         retryCount++;
@@ -1267,72 +1390,40 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
         }
     }
 
+    LogDebug("[ERROR] Translation failed after maximum retries.");
     HostPrintUTF8("{$CP0=Translation failed after maximum retries.$}\n");
-    return "[翻译失败]";
+    SrcLang = "UTF8";
+    DstLang = "UTF8";
+    return "[翻译失败: 超过最大重试次数]";
 }
 
 // ====================================================== Plugin initialization
 void OnInitialize() {
-    if (DEBUG_LOG) HostOpenConsole();
-
-    HostPrintUTF8("{$CP0=DeepSeek translation plugin loaded.$} (v0.7)\n");
-
-    LoadProfiles();
-    LoadModelList();
-
-    api_key  = HostLoadString("api_key", "");
-    acctSpec = HostLoadString("account_spec", "");
-
-    // 文本配置通道优先：所见即所跑，不必去界面里找那个隐蔽的账户入口
-    HostPrintUTF8("{$CP0=config file: $}" + ConfigFilePath() + "\n");
-
-    // 优先级：管理器烘焙进本文件的配置 > 文本配置文件 > 界面上保存的账户设置
-    if (!BAKED_ACCOUNT.empty() || !BAKED_KEY.empty()) {
-        acctSpec = BAKED_ACCOUNT;
-        if (!BAKED_KEY.empty()) api_key = BAKED_KEY;
-        HostPrintUTF8("{$CP0=config source: baked-in (generated entry)$}\n");
-    } else if (LoadConfigFile()) {
-        string fa = fileAcct.Trim();
-        string fl = fa.MakeLower();
-        if (fl == "models" || fl == "list" || fl == "help" || fa.empty()) {
-            // 这些是界面指令，启动阶段不执行，退回已保存的配置
-            HostPrintUTF8("config file: '" + fa + "' is a UI command, using saved settings\n");
-        } else {
-            acctSpec = fa;
-            if (!fileKey.empty()) api_key = fileKey;
-            HostPrintUTF8("{$CP0=config source: $}" + cfgUsedPath + "\n");
-        }
-    } else {
-        Dbg("config source: saved settings");
-    }
-
-    // 初始化阶段不弹窗，避免每次启动都跳消息框
-    HandleAccountSpec(acctSpec, api_key, false);
-
-    Dbg("endpoint = " + ResolveUrl());
-    Dbg("model = " + cfgModel + " / format = " + cfgFormat + " / auth = " + cfgAuth);
-    Dbg("profiles = " + formatInt(int(profName.length()))
-        + ", active = " + formatInt(activeProfile));
+    LogDebug("OnInitialize() called");
+    HostPrintUTF8("{$CP0=DeepSeek translation plugin loaded.$} (v1.1)\n");
+    EnsureInitialized();
 
     if (api_key.empty() && cfgAuth != "none") {
+        LogDebug("OnInitialize: API Key is empty");
         HostPrintUTF8("{$CP0=No saved API Key found. Please configure it in the settings menu.$}\n");
         return;
     }
 
     string url = ResolveUrl();
     string warmBody = BuildRequest("ping", "", "zh-CN");
-    HostIncTimeOut(20000);
+    HostIncTimeOut(5000);
     string warmResponse = HostUrlGetString(url, CurrentUA(), BuildHeaders(), warmBody);
 
     if (warmResponse.empty()) {
-        HostPrintUTF8("{$CP0=Warm-up failed: no response. Check network or endpoint.$}\n");
+        LogDebug("OnInitialize: Warm-up skipped or no response");
+        HostPrintUTF8("{$CP0=Warm-up skipped or no response.$}\n");
         return;
     }
 
     JsonReader WarmReader;
     JsonValue WarmRoot;
     if (!WarmReader.parse(warmResponse, WarmRoot)) {
-        HostPrintUTF8("{$CP0=Warm-up response could not be parsed.$}\n");
+        LogDebug("OnInitialize: Warm-up parse failed");
         return;
     }
 
@@ -1340,28 +1431,32 @@ void OnInitialize() {
     string warmText = "";
     if (cfgFormat == "anthropic") {
         JsonValue wc = WarmRoot["content"];
-        if (wc.isArray() && wc[0]["text"].isString()) {
+        if (wc.isArray() && wc.size() > 0 && wc[0]["text"].isString()) {
             warmText = wc[0]["text"].asString();
             warmOk = true;
         }
     } else {
         JsonValue wch = WarmRoot["choices"];
-        if (wch.isArray() && wch[0]["message"]["content"].isString()) {
+        if (wch.isArray() && wch.size() > 0 && wch[0]["message"]["content"].isString()) {
             warmText = wch[0]["message"]["content"].asString();
             warmOk = true;
         }
     }
 
     if (warmOk) {
+        LogDebug("OnInitialize: Warm-up success, model=" + cfgModel);
         HostPrintUTF8("{$CP0=Saved API Key loaded.$} [" + cfgModel + "]\n");
         Dbg("warm-up reply: " + warmText);
     } else if (WarmRoot["error"]["message"].isString()) {
+        LogDebug("OnInitialize: Warm-up API error: " + WarmRoot["error"]["message"].asString());
         HostPrintUTF8("{$CP0=Warm-up API error: $}" + WarmRoot["error"]["message"].asString() + "\n");
     } else {
+        LogDebug("OnInitialize: Warm-up returned unexpected payload");
         HostPrintUTF8("{$CP0=Warm-up returned an unexpected payload.$}\n");
     }
 }
 
 void OnFinalize() {
+    LogDebug("OnFinalize() called");
     HostPrintUTF8("{$CP0=DeepSeek translation plugin unloaded.$}\n");
 }

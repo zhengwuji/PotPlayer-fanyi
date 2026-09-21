@@ -76,7 +76,10 @@ a = Analysis(
     ['api_manager.py'],
     pathex=[],
     binaries=[],
-    datas=stage_tcl_tk(),
+    datas=stage_tcl_tk() + [
+        ('SubtitleTranslate - DeepSeek.as', '.'),
+        ('SubtitleTranslate - DeepSeek.ico', '.'),
+    ],
     hiddenimports=[
         'tkinter',
         'tkinter.ttk',

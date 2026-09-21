@@ -650,12 +650,48 @@ def make_entry_source(template, api):
     return template[:i] + block + template[j:]
 
 
+def find_main_template(src_dir=None):
+    # 优先使用打包内嵌或本工具同级的最新主模板，避免从插件目录读到历史旧模板
+    cands = [
+        getattr(sys, "_MEIPASS", ""),
+        os.path.dirname(os.path.abspath(__file__)),
+        os.path.dirname(os.path.abspath(sys.executable)),
+        os.getcwd(),
+    ]
+    if src_dir and src_dir not in cands:
+        cands.append(src_dir)
+    cands.append(plugin_dir())
+    for cand in cands:
+        if cand:
+            p = os.path.join(cand, MAIN_PLUGIN)
+            if os.path.isfile(p):
+                return p
+    return ""
+
+
+def find_main_ico(src_dir=None):
+    cands = [
+        getattr(sys, "_MEIPASS", ""),
+        os.path.dirname(os.path.abspath(__file__)),
+        os.path.dirname(os.path.abspath(sys.executable)),
+        os.getcwd(),
+    ]
+    if src_dir and src_dir not in cands:
+        cands.append(src_dir)
+    cands.append(plugin_dir())
+    for cand in cands:
+        if cand:
+            p = os.path.join(cand, MAIN_ICON)
+            if os.path.isfile(p):
+                return p
+    return ""
+
+
 def plan_entries(store, src_dir=None):
     """返回 [(文件名, 内容或None表示复制ico, 源路径)]，不落盘，便于先预览/测试"""
-    d = src_dir or plugin_dir()
-    tpl_path = os.path.join(d, MAIN_PLUGIN)
-    if not os.path.isfile(tpl_path):
-        return [], f"找不到主插件模板：{tpl_path}"
+    tpl_path = find_main_template(src_dir)
+    if not tpl_path or not os.path.isfile(tpl_path):
+        return [], f"找不到主插件模板：{MAIN_PLUGIN}（已扫描插件目录与当前目录）"
     with open(tpl_path, "r", encoding="utf-8") as fh:
         template = fh.read()
 
@@ -683,7 +719,7 @@ def generate_entries(store, target_dir=None, src_dir=None):
         return [], f"目录不存在：{d}"
     written = []
     # 附带的图标（照着主插件的 ico 复制一份同名副本，让列表有条目图标）
-    ico_src = os.path.join(src_dir or d, MAIN_ICON)
+    ico_src = find_main_ico(src_dir or d)
     for fname, content in plan:
         p = os.path.join(d, fname)
         try:
@@ -692,7 +728,7 @@ def generate_entries(store, target_dir=None, src_dir=None):
         except OSError as exc:
             return written, f"写入 {fname} 失败：{exc}"
         written.append(fname)
-        if os.path.isfile(ico_src):
+        if ico_src and os.path.isfile(ico_src):
             ico_dst = os.path.join(d, fname[:-4] + ".ico")
             try:
                 import shutil
@@ -978,6 +1014,8 @@ def run_gui(auto_close_ms=None):
     ttk.Button(act, text="保存", command=lambda: on_save()).pack(side="left", padx=6)
     ttk.Button(act, text="打开配置位置",
                command=lambda: on_open()).pack(side="left")
+    ttk.Button(act, text="查看运行日志",
+               command=lambda: on_open_log()).pack(side="left", padx=6)
 
     tk.Label(root, textvariable=status, anchor="w",
              relief="sunken").pack(side="bottom", fill="x")
@@ -1142,6 +1180,8 @@ def run_gui(auto_close_ms=None):
 
     def on_generate():
         """为每条 API 生成一个 PotPlayer 插件条目，让它出现在「翻译引擎」列表里"""
+        form_to_api()
+        save_store(store)
         store_snapshot = load_store()
         if not store_snapshot.get("apis"):
             messagebox.showwarning("没有 API", "先在左边新建至少一条 API")
@@ -1186,6 +1226,31 @@ def run_gui(auto_close_ms=None):
             os.startfile(d)  # noqa: S606
         except OSError as exc:
             messagebox.showerror("打不开", str(exc))
+
+    def on_open_log():
+        """打开 PotPlayer 翻译插件运行日志"""
+        log_name = "deepseek_translate.log"
+        target = None
+        for d in CONFIG_DIRS + [config_dir()]:
+            if d and os.path.isdir(d):
+                p = os.path.join(d, log_name)
+                if os.path.isfile(p):
+                    target = p
+                    break
+        if not target:
+            target = os.path.join(config_dir(), log_name)
+            if not os.path.isfile(target):
+                messagebox.showinfo(
+                    "日志文件尚未生成",
+                    f"日志文件路径为：\n{target}\n\n"
+                    "当在 PotPlayer 中开启翻译或点击「测试」时，\n"
+                    "日志会自动写入该文件，并弹出控制台黑框显示实时输出。\n"
+                    "请先在 PotPlayer 触发一次翻译后再点击查看。")
+                return
+        try:
+            os.startfile(target)  # noqa: S606
+        except OSError as exc:
+            messagebox.showerror("打不开日志", str(exc))
 
     def on_autoadapt():
         """一键自动适配：Key / 协议 / 模型 全自动，不需要手工转换"""

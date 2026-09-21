@@ -294,7 +294,53 @@ def install(strings):
         print("next to this installer and run it again for a fully offline install.")
         sys.exit(1)
 
+    # 自动扫描并同步升级已存在的自定义条目插件（保证其具备最新的日志与初始化逻辑）
+    upgrade_custom_entries(target_path, strings)
+
     print(strings["installation_complete"].format(target_path))
+
+
+def upgrade_custom_entries(target_path, strings):
+    """自动扫描并升级已存在的自定义条目（例如 SubtitleTranslate - DeepSeek (localcmdcode2api).as）。"""
+    main_as = os.path.join(target_path, "SubtitleTranslate - DeepSeek.as")
+    if not os.path.isfile(main_as):
+        return
+    try:
+        with open(main_as, "r", encoding="utf-8") as fh:
+            template = fh.read()
+    except Exception as exc:
+        print(f"读取主模板失败: {exc}")
+        return
+
+    pattern = re.compile(r"^SubtitleTranslate - DeepSeek \((.+)\)\.as$", re.IGNORECASE)
+    baked_pattern = re.compile(
+        r'// ==== BAKED CONFIG BEGIN ====(.*?)// ==== BAKED CONFIG END ====',
+        re.DOTALL
+    )
+
+    try:
+        items = os.listdir(target_path)
+    except Exception:
+        return
+
+    for item in items:
+        m = pattern.match(item)
+        if not m:
+            continue
+        entry_file = os.path.join(target_path, item)
+        try:
+            with open(entry_file, "r", encoding="utf-8") as fh:
+                old_content = fh.read()
+            bm = baked_pattern.search(old_content)
+            if not bm:
+                continue
+            old_baked_block = bm.group(0)
+            new_content = baked_pattern.sub(old_baked_block, template)
+            with open(entry_file, "w", encoding="utf-8") as fh:
+                fh.write(new_content)
+            print(f"  [OK] 同步升级自定义条目插件: {item}")
+        except Exception as exc:
+            print(f"  [WARN] 升级条目插件 {item} 失败: {exc}")
 
 
 APP_VERSION = "1.1"
