@@ -1,0 +1,74 @@
+{
+  "apis": [
+    {
+      "name": "localcmdcode2api",
+      "url": "http://127.0.0.1:11434/v1",
+      "model": "Qwen/Qwen3.8-Flash",
+      "format": "openai",
+      "auth": "bearer",
+      "key": "your_api_key_here",
+      "maxtok": 1024,
+      "no_reasoning": false,
+      "extra": "",
+      "body": "",
+      "note": "本地 cmdcode2api 网关"
+    },
+    {
+      "name": "JetHub: CodeBuddy (国内版)",
+      "url": "https://copilot.tencent.com/v2",
+      "model": "glm-5.3-flash",
+      "format": "jethub",
+      "provider": "buddy",
+      "auth": "bearer",
+      "key": "",
+      "maxtok": 2048,
+      "no_reasoning": true,
+      "extra": "",
+      "body": "",
+      "note": "Jet Hub 腾讯 CodeBuddy 自动多账号轮换池"
+    },
+    {
+      "name": "JetHub: WorkBuddy (国际版)",
+      "url": "https://www.workbuddy.ai/v2",
+      "model": "deepseek-v4.1-flash",
+      "format": "jethub",
+      "provider": "workbuddy",
+      "auth": "bearer",
+      "key": "",
+      "maxtok": 2048,
+      "no_reasoning": true,
+      "extra": "",
+      "body": "",
+      "note": "Jet Hub 腾讯 WorkBuddy 国际版多账号轮询"
+    },
+    {
+      "name": "JetHub: WorkBuddy (国内版)",
+      "url": "https://copilot.tencent.com/v2",
+      "model": "deepseek-v4-flash",
+      "format": "jethub",
+      "provider": "workbuddy-cn",
+      "auth": "bearer",
+      "key": "",
+      "maxtok": 2048,
+      "no_reasoning": true,
+      "extra": "",
+      "body": "",
+      "note": "Jet Hub 腾讯 WorkBuddy 国内版"
+    },
+    {
+      "name": "JetHub: Antigravity (Google本地直连)",
+      "url": "http://127.0.0.1 (本地RPC)",
+      "model": "Gemini 3.8 Flash (High)",
+      "format": "jethub",
+      "provider": "antigravity",
+      "auth": "none",
+      "key": "",
+      "maxtok": 2048,
+      "no_reasoning": false,
+      "extra": "",
+      "body": "",
+      "note": "Google Antigravity 本地语言服务器直连"
+    }
+  ],
+  "active": "JetHub: CodeBuddy (国内版)"
+}

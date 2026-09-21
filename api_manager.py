@@ -1016,6 +1016,8 @@ def run_gui(auto_close_ms=None):
                command=lambda: on_open()).pack(side="left")
     ttk.Button(act, text="查看运行日志",
                command=lambda: on_open_log()).pack(side="left", padx=6)
+    ttk.Button(act, text="🎙️ 语音听翻/字幕生成",
+               command=lambda: on_open_audio_tool()).pack(side="left")
 
     tk.Label(root, textvariable=status, anchor="w",
              relief="sunken").pack(side="bottom", fill="x")
@@ -1251,6 +1253,26 @@ def run_gui(auto_close_ms=None):
             os.startfile(target)  # noqa: S606
         except OSError as exc:
             messagebox.showerror("打不开日志", str(exc))
+
+    def on_open_audio_tool():
+        """打开语音实时听翻与离线字幕生成助手"""
+        cands = [
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "audio_subtitle_tool.py"),
+            os.path.join(os.getcwd(), "audio_subtitle_tool.py"),
+            r"g:\Personal\Desktop\fanyi\PotPlayer_DeepSeek_Translate\audio_subtitle_tool.py",
+        ]
+        target = None
+        for c in cands:
+            if os.path.isfile(c):
+                target = c
+                break
+        if target:
+            try:
+                subprocess.Popen([sys.executable, target])
+            except Exception as exc:
+                messagebox.showerror("启动失败", str(exc))
+        else:
+            messagebox.showerror("未找到工具", "找不到 audio_subtitle_tool.py 文件")
 
     def on_autoadapt():
         """一键自动适配：Key / 协议 / 模型 全自动，不需要手工转换"""

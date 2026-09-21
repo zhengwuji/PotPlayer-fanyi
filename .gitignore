@@ -32,3 +32,12 @@ __pycache__/
 
 # 忽略 Windows 系统文件
 Thumbs.db
+
+# 忽略私密密钥与本地运行时配置文件（请参考 apis_config.example.json 模板）
+apis_config.json
+deepseek_apis.json
+*.wav
+*.mp4
+*.mkv
+*.avi
+JUQ*

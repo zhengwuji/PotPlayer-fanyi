@@ -262,8 +262,9 @@ bool LoadConfigFile() {
     HostFileClose(fp);
     if (txt.empty()) return false;
 
-    // 记事本可能存成带 BOM 的 UTF-8，BOM 会粘在第一行的键名上
+    // 记事本可能存成带 BOM 的 UTF-8，BOM 会粘在第一行的键名上；同时剥除 Windows 回车符 \r
     txt.replace("\uFEFF", "");
+    txt.replace("\r", "");
 
     array<string> lines = txt.split("\n");
     int i = 0;
@@ -1013,15 +1014,22 @@ string LangName(const string &in code) {
 
 // ============================================================ String helpers
 string JsonEscape(const string &in input) {
-    string output = input;
-    output.replace("\\", "\\\\");
-    output.replace("\"", "\\\"");
-    output.replace("\n", "\\n");
-    output.replace("\r", "\\r");
-    output.replace("\t", "\\t");
-    output.replace("\b", "\\b");
-    output.replace("\f", "\\f");
-    return output;
+    string res = "";
+    int i = 0;
+    int n = int(input.length());
+    while (i < n) {
+        string c = input.substr(i, 1);
+        if (c == "\\") res += "\\\\";
+        else if (c == "\"") res += "\\\"";
+        else if (c == "\n") res += "\\n";
+        else if (c == "\r") res += "\\r";
+        else if (c == "\t") res += "\\t";
+        else if (c == "\b") res += "\\b";
+        else if (c == "\f") res += "\\f";
+        else res += c;
+        i++;
+    }
+    return res;
 }
 
 string Finalize(const string &in raw, const string &in dst) {
@@ -1104,7 +1112,7 @@ string BuildSystemPrompt(const string &in src, const string &in dst) {
               + "Use the earlier turns as context to keep terminology, character names and tone consistent, "
               + "but never translate or repeat them. "
               + "Rules: output exactly one line with no line breaks; "
-              + "do not add sentence-final punctuation such as . ! ? \u3002 \uFF01 \uFF1F; "
+              + "do not add sentence-final punctuation such as . ! ? 。 ！ ？; "
               + "keep necessary internal punctuation (commas, enumeration marks, dashes) so the line stays readable; "
               + "do not merge or split sentences; do not add explanations, notes, quotes or the original text; "
               + "for ambiguous terms pick the reading that best fits the context; "
@@ -1277,20 +1285,20 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
         return cached;
     }
 
+    LogDebug("Preparing request...");
     string url = ResolveUrl();
+    LogDebug("Target URL: " + url);
     string body = BuildRequest(Text, SrcLang, DstLang);
+    LogDebug("Request body generated (" + formatInt(int(body.length())) + " bytes)");
     string headers = BuildHeaders();
-
-    LogDebug("Request URL: " + url);
-    LogDebug("Request Headers: " + headers);
-    LogDebug("Request Body length: " + formatInt(int(body.length())) + " bytes");
+    LogDebug("Headers generated");
 
     int retryCount = 0;
     int delay = baseRetryDelay;
 
     while (retryCount < maxRetries) {
         LogDebug("HTTP request attempt #" + formatInt(retryCount + 1) + " / " + formatInt(maxRetries) + "...");
-        HostIncTimeOut(20000);
+        HostIncTimeOut(30000);
         string response = HostUrlGetString(url, CurrentUA(), headers, body);
 
         if (response.empty()) {
@@ -1326,13 +1334,28 @@ string Translate(string Text, string &in SrcLang, string &in DstLang) {
             JsonValue c = Root["content"];
             if (c.isArray() && c.size() > 0 && c[0]["text"].isString()) {
                 extracted = c[0]["text"].asString();
-                gotIt = true;
+                if (!extracted.empty()) gotIt = true;
             }
         } else {
             JsonValue choices = Root["choices"];
-            if (choices.isArray() && choices.size() > 0 && choices[0]["message"]["content"].isString()) {
-                extracted = choices[0]["message"]["content"].asString();
-                gotIt = true;
+            if (choices.isArray() && choices.size() > 0) {
+                JsonValue msg = choices[0]["message"];
+                if (msg["content"].isString()) {
+                    extracted = msg["content"].asString();
+                    if (!extracted.empty()) gotIt = true;
+                }
+                if (!gotIt && msg["reasoning_content"].isString()) {
+                    string rc = msg["reasoning_content"].asString();
+                    if (!rc.empty()) {
+                        LogDebug("Fallback: using reasoning_content as response");
+                        extracted = rc;
+                        gotIt = true;
+                    }
+                }
+                if (!gotIt && choices[0]["text"].isString()) {
+                    extracted = choices[0]["text"].asString();
+                    if (!extracted.empty()) gotIt = true;
+                }
             }
         }
 
@@ -1402,58 +1425,6 @@ void OnInitialize() {
     LogDebug("OnInitialize() called");
     HostPrintUTF8("{$CP0=DeepSeek translation plugin loaded.$} (v1.1)\n");
     EnsureInitialized();
-
-    if (api_key.empty() && cfgAuth != "none") {
-        LogDebug("OnInitialize: API Key is empty");
-        HostPrintUTF8("{$CP0=No saved API Key found. Please configure it in the settings menu.$}\n");
-        return;
-    }
-
-    string url = ResolveUrl();
-    string warmBody = BuildRequest("ping", "", "zh-CN");
-    HostIncTimeOut(5000);
-    string warmResponse = HostUrlGetString(url, CurrentUA(), BuildHeaders(), warmBody);
-
-    if (warmResponse.empty()) {
-        LogDebug("OnInitialize: Warm-up skipped or no response");
-        HostPrintUTF8("{$CP0=Warm-up skipped or no response.$}\n");
-        return;
-    }
-
-    JsonReader WarmReader;
-    JsonValue WarmRoot;
-    if (!WarmReader.parse(warmResponse, WarmRoot)) {
-        LogDebug("OnInitialize: Warm-up parse failed");
-        return;
-    }
-
-    bool warmOk = false;
-    string warmText = "";
-    if (cfgFormat == "anthropic") {
-        JsonValue wc = WarmRoot["content"];
-        if (wc.isArray() && wc.size() > 0 && wc[0]["text"].isString()) {
-            warmText = wc[0]["text"].asString();
-            warmOk = true;
-        }
-    } else {
-        JsonValue wch = WarmRoot["choices"];
-        if (wch.isArray() && wch.size() > 0 && wch[0]["message"]["content"].isString()) {
-            warmText = wch[0]["message"]["content"].asString();
-            warmOk = true;
-        }
-    }
-
-    if (warmOk) {
-        LogDebug("OnInitialize: Warm-up success, model=" + cfgModel);
-        HostPrintUTF8("{$CP0=Saved API Key loaded.$} [" + cfgModel + "]\n");
-        Dbg("warm-up reply: " + warmText);
-    } else if (WarmRoot["error"]["message"].isString()) {
-        LogDebug("OnInitialize: Warm-up API error: " + WarmRoot["error"]["message"].asString());
-        HostPrintUTF8("{$CP0=Warm-up API error: $}" + WarmRoot["error"]["message"].asString() + "\n");
-    } else {
-        LogDebug("OnInitialize: Warm-up returned unexpected payload");
-        HostPrintUTF8("{$CP0=Warm-up returned an unexpected payload.$}\n");
-    }
 }
 
 void OnFinalize() {

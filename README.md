@@ -1,85 +1,177 @@
-# PotPlayer DeepSeek Translate Plugin
+# PotPlayer AI 智能字幕翻译与视频合成大师 (PotPlayer-fanyi)
 
-![GitHub License](https://img.shields.io/badge/license-MIT-blue.svg)
-![GitHub Stars](https://img.shields.io/github/stars/Liu8Can/PotPlayer_DeepSeek_Translate?style=social)
-![GitHub Forks](https://img.shields.io/github/forks/Liu8Can/PotPlayer_DeepSeek_Translate?style=social)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-brightgreen.svg)](#)
+[![GPU Acceleration](https://img.shields.io/badge/NVIDIA-CUDA%20%26%20NVENC-76B900.svg)](#)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-7.0%2B-orange.svg)](#)
 
----
-
-## 📖 简介 / Introduction
-
-本仓库是基于 [Felix3322/PotPlayer_Chatgpt_Translate](https://github.com/Felix3322/PotPlayer_Chatgpt_Translate) 修改而来，专为 PotPlayer 设计的实时字幕翻译插件，适配 **DeepSeek API**。通过集成 DeepSeek 的强大文本生成能力，该插件能够在观看视频时实时翻译字幕，打破语言障碍，提升您的观影体验。
-
-This repository is a modified version of [Felix3322/PotPlayer_Chatgpt_Translate](https://github.com/Felix3322/PotPlayer_Chatgpt_Translate), designed for PotPlayer with support for **DeepSeek API**. By leveraging DeepSeek's powerful text generation capabilities, this plugin enables real-time subtitle translation while watching videos, breaking language barriers and enhancing your viewing experience.
+> 专为影视爱好者、字幕组、生肉视频观众打造的 **全能智能 AI 字幕处理与视频压制工作站**。
+> 结合 **PotPlayer 实时字幕翻译插件** + **独立三合一全自动语音转写/翻译/视频封装大师**，全面支持 DeepSeek、Qwen、GLM、Kimi 以及 Jet Hub 多账号池生态。
 
 ---
 
-## 🚀 功能特性 / Features
+## 目录
 
-- **实时翻译**：在播放视频时自动翻译字幕。
-- **多语言支持**：支持多种语言的翻译。
-- **简单配置**：只需填入 DeepSeek API Key，无需输入模型名或请求接口。
-- **轻量易用**：插件体积小，安装简单，即插即用。
+- [✨ 最新更新日志 (Changelog)](#-最新更新日志-changelog)
+- [🌟 核心功能一览](#-核心功能一览)
+- [🖥️ 软件界面与三大模式](#️-软件界面与三大模式)
+- [🚀 快速开始与环境要求](#-快速开始与环境要求)
+- [📖 详细使用教程](#-详细使用教程)
+- [🤖 支持的 AI 方案与模型](#-支持的-ai-方案与模型)
+- [❓ 常见问题排查 (FAQ)](#-常见问题排查-faq)
+- [📜 开源协议与致谢](#-开源协议与致谢)
 
 ---
 
-## 🛠️ 安装与使用 / Installation & Usage
+## ✨ 最新更新日志 (Changelog)
 
-- 视频教程：https://www.bilibili.com/video/BV1VLrmYYEt3/
+### v2.2.0 (最新发布)
+- 🎬 **合成流式进度监控升级**：
+  - **模式三「字幕直接合成到视频工具箱」全功能升级**：新增专属动态进度条 `ttk.Progressbar`，流式捕获 FFmpeg 处理时间轴与速率，实时显示百分比（如 `45% (01:05:22/02:23:13) | 速度: 85x`）。
+  - **模式一与模式二平滑联动**：视频最终合成阶段接入流式进度回调，进度条匀速推进至 100%，杜绝大文件流拷贝时的“卡死”假象。
+  - **新增任务安全取消机制**：合成中可随时点击「取消任务」，安全终止 FFmpeg 子进程，不占用系统资源。
+- 🛡️ **长思考模型自适应容灾与极速直译**：
+  - 单批台词粒度优化至 **5 句**，大幅降低思考模型（如 `Qwen3.8-Flash`、`DeepSeek-R1`）思考链长度，提速 2~3 倍。
+  - 超时保护窗口放宽至 **180 秒**，彻底消除单批长思考导致的读取超时。
+  - 优化重试提示：区分读超时与网络波动，成功恢复后自动提示续接成功。
+  - 批量翻译每批成功时实时向 UI 控制台刷新进度日志。
+- 🚀 **Jet Hub 多账号池深度集成**：
+  - 顶部一键打开「Jet Hub 账号管理」，支持腾讯 CodeBuddy、WorkBuddy、华为云 CodeArts 及 Google Antigravity 本地通道。
+  - 支持多账号轮询与限流故障转移。
+- 🔒 **全流程安全脱敏**：
+  - 本地密钥配置文件（`apis_config.json`）自动隔离，引入 `apis_config.example.json` 标准模板，杜绝敏感凭据泄露。
 
+---
 
-### 1. **下载插件**
+## 🌟 核心功能一览
 
-- 从 [Releases](https://github.com/Liu8Can/PotPlayer_DeepSeek_Translate/releases) 下载最新版本的插件文件。
-- **不想折腾的的直接下载 `installer.exe` 即可一键安装**
+| 模块 | 核心能力 | 适用场景 |
+| :--- | :--- | :--- |
+| **模式一：已有字幕直接翻译** | 智能解析 `.srt` / `.vtt` / `.ass` 字幕，保持时间轴 100% 精准；支持双语对照字幕；可选自动封装为带字幕成品视频。 | 已下载外挂外文字幕，需要机翻精润或生成双语字幕。 |
+| **模式二：生肉纯视频一键生字幕** | 本地 `faster-whisper` GPU 极速语音识别，自动时间轴切分；对接大模型批量翻译；一键极速封装软字幕或 GPU 画面烙印硬字幕。 | 无字幕生肉影视、生肉动漫、外语公开课、发布会视频。 |
+| **模式三：字幕直接合成视频工具箱** | **无损秒级内嵌软字幕**（保持 100% 原始画质，播放器随时开关字幕轨）；<br>**NVIDIA GPU 极速硬字幕压制**（画面烧录烙印，手机/微信/电视全兼容）。 | 已有视频和字幕，无需重新翻译，只想快速合成压制成片。 |
+| **PotPlayer 实时字幕翻译插件** | 基于 AngelScript 开发的实时流式翻译插件（`SubtitleTranslate - DeepSeek.as`），看视频时边播边翻。 | 观看在线流媒体、直播或外语影视时的沉浸式实时同传。 |
+| **Jet Hub 多账号管理联动** | 腾讯 CodeBuddy / WorkBuddy 多账号轮换、签到领取积分、限流避让；Google Antigravity IDE 本地私有语言服务器直连。 | 大批量视频翻译，避免单账号额度不足或限流卡顿。 |
 
-### 2. **安装插件**
+---
 
-- 解压后将 `SubtitleTranslate - DeepSeek.as`和 `SubtitleTranslate - DeepSeek.ico`两个文件复制到 PotPlayer 的翻译插件目录中，例如：
+## 🖥️ 软件界面与三大模式
+
+### 模式一：已有字幕文件直接翻译 (`.srt` / `.vtt` / `.ass`)
+1. 点击「浏览字幕」，选择需要翻译的字幕文件；
+2. 可自动侦测关联同名视频文件；
+3. 选择原语种与目标语言（支持中文、英语、日语、韩语、法语、德语、俄语等）；
+4. 勾选是否输出「双语对照字幕」；
+5. 可选「无损封装极速软字幕」或「自动压制硬字幕」；
+6. 点击「开始一键翻译字幕」，全自动分块并行翻译并落盘。
+
+### 模式二：无字幕视频提取转写并生成字幕（生肉视频克星）
+1. 选中生肉视频（如 `.mp4`, `.mkv`, `.avi`, `.mov`, `.flv`, `.ts`）；
+2. 自动识别本机 NVIDIA 显卡（如 RTX 5090、5060 Ti、4090 等），启用 CUDA 硬件加速；
+3. 选择转写模型精度（`small` / `medium` / `large-v3`）；
+4. 程序调用 `faster-whisper` 进行 VAD 语音切片与说话人对齐，生成精确时间轴；
+5. 自动分批调用大模型极速直译；
+6. 一键直接产出字幕文件或带字幕的成品视频。
+
+### 模式三：字幕直接合成到视频工具箱
+1. 分别选取「源视频文件」与「对应字幕文件」；
+2. 选择合成方式：
+   - **⚡ 极速内嵌软字幕**：流拷贝（Stream Copy），画质零损失，1~2 秒封装完成，播放器可随意开关中文字幕轨。
+   - **🔥 硬字幕画面压制**：调用 NVIDIA NVENC 硬件编码，将字幕烙印在画面底层，适合导入手机、平板或发送到微信群观看。
+3. 界面提供**实时进度条、处理时长、剩余进度与倍速监控**，支持一键取消。
+
+---
+
+## 🚀 快速开始与环境要求
+
+### 1. 环境依赖
+- **操作系统**：Windows 10 / 11 (64位)
+- **Python**：Python 3.10 及以上
+- **FFmpeg**：建议放置在系统 PATH 中，或安装 PotPlayer 自带的 ffmpeg 路径
+- **GPU 驱动**（推荐）：NVIDIA 显卡（显存 $\ge$ 4GB），支持 CUDA 硬件加速
+
+### 2. 安装 Python 依赖
+```bash
+# 进入工程目录
+cd PotPlayer_DeepSeek_Translate
+
+# 安装核心依赖
+pip install -r requirements.txt
+pip install faster-whisper requests
+```
+
+### 3. 配置 API 凭据（安全脱敏模板）
+首次运行前，复制配置模板：
+```bash
+copy apis_config.example.json apis_config.json
+```
+根据需求在软件界面或 `apis_config.json` 中配置您的 API Key：
+- 支持 **OpenAI 兼容接口**（如 `http://127.0.0.1:11434/v1`、DeepSeek 官方 API 等）；
+- 支持 **Jet Hub 多账号生态**（腾讯云 CodeBuddy / WorkBuddy、华为云 CodeArts 等）。
+
+### 4. 启动程序
+- 双击运行根目录下的 `run_audio_subtitles.bat`；
+- 或在终端执行：
+  ```bash
+  python audio_subtitle_tool.py
   ```
-  D:\Program Files\DAUM\PotPlayer\Extension\Subtitle\Translate
-  ```
-
-### 3. **配置 API Key**
-
-1. 打开 PotPlayer，右键点击播放器界面，选择 **选项/偏好设置**。
-2. 在左侧菜单中找到 **字幕** -> **实时字幕翻译** -> **实时字幕翻译设置**。
-3. 在插件设置中，填入您的 **DeepSeek API Key**。一定要点击——账户设置——确定。测试——确定。以上两步操作，确保新的参数被注入。刚开始几段话会显示乱码，不要担心，因为网络请求刚开始并没有返回参数。可以尝试快进下。同时在请求中，有概率返回很多字幕的内容，已经尽可能减少了，但还没法完全避免。
-4. 保存设置并重启 PotPlayer。
-
-### 4. **开始使用**
-
-- 播放视频时，插件会自动翻译字幕并显示在屏幕上。
 
 ---
 
-## 📜 协议 / License
+## 📖 详细使用教程
 
-本项目采用 **MIT 许可证**，详情请参阅 [LICENSE](LICENSE) 文件。
+### 一、PotPlayer 实时字幕翻译插件安装
+1. 打开工程目录下的 `installer.py`（或直接运行打包后的 `installer.exe`）；
+2. 程序会自动检测 PotPlayer 安装路径（通常为 `C:\Program Files\DAUM\PotPlayer`）；
+3. 一键点击「安装插件到 PotPlayer」；
+4. 打开 PotPlayer：
+   - 按 `F5` 打开「参数选项」；
+   - 展开「扩展」 $\rightarrow$ 「字幕翻译」；
+   - 翻译引擎选择 **`DeepSeek Translate`**，点击「账户设置」选择配置的 API 方案；
+   - 播放外语视频时，勾选「总是使用实时字幕翻译」即可实时同传。
 
----
-
-## 🙏 致谢 / Acknowledgments
-
-- 感谢 [Felix3322](https://github.com/Felix3322) 提供的原始代码库 [PotPlayer_Chatgpt_Translate](https://github.com/Felix3322/PotPlayer_Chatgpt_Translate)。
-- 感谢 [yxyxyz6](https://github.com/yxyxyz6) 提供的修改参考 [yxyxyz6/PotPlayer_ollama_Translate](https://github.com/yxyxyz6/PotPlayer_ollama_Translate/tree/main)
-- 感谢 **DeepSeek** 提供的强大模型支持，为插件提供了高效的翻译能力。
-
----
-
-## 📧 联系与支持 / Contact & Support
-
-如果您有任何问题或建议，欢迎通过以下方式联系我：
-
-- **Email**: [liucan@example.com](mailto:liucan@example.com)
-- **GitHub Issues**: [提交 Issue](https://github.com/Liu8Can/PotPlayer_DeepSeek_Translate/issues)
-
----
-
-## 🌟 Star & Fork
-
-如果这个项目对您有帮助，欢迎给个 ⭐️ **Star** 支持一下！也欢迎 **Fork** 并贡献您的代码！
+### 二、批量视频生成字幕与压制最佳实践
+1. **对于常规日漫/美剧/电影**：
+   - 识别精度选择 `small`（速度最快，RTX 显卡 2 小时电影仅需 1~2 分钟识别完成）；
+   - 精度要求极高时选择 `medium`；
+   - 模型推荐选择 **`Deepseek-V4.1-Flash`** 或 **`Qwen/Qwen3.8-Flash`**（地道口语化，速度极快）。
+2. **合成方式选择**：
+   - 本地电脑播放：首选 **极速内嵌软字幕**（无损秒出，不耗费显卡转码）；
+   - 投屏、发送手机或剪辑：选择 **自动压制硬字幕**（NVIDIA NVENC 秒级压制）。
 
 ---
 
-**Happy Watching! 🎥**
+## 🤖 支持的 AI 方案与模型
+
+| 方案类别 | 接入方式 | 推荐模型 | 优势特点 |
+| :--- | :--- | :--- | :--- |
+| **本地中转网关** | `http://127.0.0.1:11434/v1` | `deepseek-v4.1-flash`, `Qwen3.8-Flash` | 极速响应，支持自定义 prompt，批量字幕直译首选 |
+| **Jet Hub: CodeBuddy** | 腾讯云账号池 | `deepseek-v4.1-flash` (0.03x), `glm-5.3-flash` (0.06x) | 极低消耗倍率，多账号智能轮换与避让限流 |
+| **Jet Hub: WorkBuddy** | 国际版 / 国内版 | `deepseek-v4.1-flash`, `Kimi-K3` | 强大的长文本语境润色，口语化表达地道自然 |
+| **Jet Hub: Antigravity** | 本地私有 RPC 直连 | `Gemini 3.8 Flash`, `Claude 3.7 Sonnet` | 零配置直连本地 IDE 语言服务器通道 |
+
+---
+
+## ❓ 常见问题排查 (FAQ)
+
+### Q1: 视频较长时，出现“模型深度思考/连接超时”提示？
+> **解答**：本工具已内置自适应超时保护（180 秒）与指数退避重连机制。遇到模型长篇推理时，程序会自动保持连接并在第 1 次重试时恢复，同时已优化单批句子数为 5 句并注入极速直译约束，无需手动干预。
+
+### Q2: 为什么软字幕封装时进度停了一小会儿？
+> **解答**：软字幕封装属于流拷贝（Stream Copy），不会对画面重编码，但对于 8GB 以上的高清大片，从硬盘读出并重新写入 8GB 数据仍需 1 分钟左右的磁盘 I/O。新版已加入实时进度条与处理速率显示，可清晰看到当前已写入的时间与进度百分比。
+
+### Q3: 找不到 ffmpeg？
+> **解答**：程序会自动扫描常见的 PotPlayer 安装目录及环境变量。如果提示未找到，请确保已安装 FFmpeg 并将其 `bin/` 目录加入系统环境变量 `PATH`。
+
+---
+
+## 📜 开源协议与致谢
+
+- 本项目采用 **MIT 许可证** 开源，详情请参阅 [LICENSE](LICENSE) 文件。
+- 感谢 [PotPlayer](https://potplayer.daum.net/) 优秀的播放器扩展能力。
+- 感谢 [faster-whisper](https://github.com/SYSTRAN/faster-whisper) 提供的极速语音识别引擎。
+- 感谢 [DeepSeek](https://www.deepseek.com/) 提供的顶尖中文大模型底座。
+
+---
+
+**享受极致观影与智能翻译体验！🎥✨**

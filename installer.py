@@ -9,6 +9,8 @@ import win32com.client
 from concurrent.futures import ThreadPoolExecutor
 from requests.exceptions import RequestException
 import subprocess
+import json
+import re
 
 
 # 定义多语言字符串
@@ -294,10 +296,133 @@ def install(strings):
         print("next to this installer and run it again for a fully offline install.")
         sys.exit(1)
 
+    # 自动从 deepseek_apis.json 安装已配置的 API 条目插件
+    install_saved_apis(target_path, strings)
+
     # 自动扫描并同步升级已存在的自定义条目插件（保证其具备最新的日志与初始化逻辑）
     upgrade_custom_entries(target_path, strings)
 
     print(strings["installation_complete"].format(target_path))
+
+
+def find_store_file():
+    """查找 API 管理器保存的 deepseek_apis.json"""
+    dirs = [
+        os.path.join(os.environ.get("APPDATA", ""), "PotPlayerMini64"),
+        os.path.join(os.environ.get("APPDATA", ""), "DAUM", "PotPlayerMini64"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "PotPlayerMini64"),
+        resource_dir(),
+        os.getcwd(),
+    ]
+    for d in dirs:
+        if d:
+            p = os.path.join(d, "deepseek_apis.json")
+            if os.path.isfile(p):
+                return p
+    return None
+
+
+def safe_entry_name(name):
+    bad = '<>:"/\\|?*'
+    out = "".join("_" if c in bad else c for c in (name or "").strip())
+    out = out.strip(" .")
+    return out or "api"
+
+
+def build_account_spec_for_entry(api):
+    parts = []
+    if api.get("url"):
+        parts.append("url=" + api["url"].strip())
+    if api.get("model"):
+        parts.append("model=" + api["model"].strip())
+    if api.get("format") and api["format"] != "openai":
+        parts.append("format=" + api["format"])
+    if api.get("auth") and api["auth"] != "bearer":
+        parts.append("auth=" + api["auth"])
+    try:
+        mt = int(api.get("maxtok") or 512)
+    except (TypeError, ValueError):
+        mt = 512
+    if mt != 512:
+        parts.append("maxtok=" + str(mt))
+    if api.get("no_reasoning"):
+        parts.append('body="reasoning_effort":"none"')
+    if api.get("body"):
+        parts.append("body=" + api["body"].strip())
+    if api.get("extra"):
+        parts.append("extra=" + api["extra"].strip())
+    return "; ".join(parts)
+
+
+def make_entry_source_from_template(template, api):
+    BAKED_BEGIN = "// ==== BAKED CONFIG BEGIN ===="
+    BAKED_END = "// ==== BAKED CONFIG END ===="
+    i = template.find(BAKED_BEGIN)
+    j = template.find(BAKED_END)
+    if i == -1 or j == -1:
+        return template
+    j += len(BAKED_END)
+
+    def esc(s):
+        return (s or "").replace("\\", "\\\\").replace('"', '\\"')
+
+    block = (
+        BAKED_BEGIN + "\n"
+        "// 由「API 管理器」/「安装程序」生成 —— 本文件对应一个 PotPlayer 插件条目\n"
+        "// 想改配置请回管理器改，再重新生成；手改会被覆盖。\n"
+        f'string BAKED_NAME    = "{esc(api.get("name"))}";\n'
+        f'string BAKED_ACCOUNT = "{esc(build_account_spec_for_entry(api))}";\n'
+        f'string BAKED_KEY     = "{esc(api.get("key"))}";\n'
+        + BAKED_END
+    )
+    return template[:i] + block + template[j:]
+
+
+def install_saved_apis(target_path, strings):
+    """自动安装 deepseek_apis.json 中已保存配置的全部 API 条目插件与图标"""
+    main_as = os.path.join(target_path, "SubtitleTranslate - DeepSeek.as")
+    main_ico = os.path.join(target_path, "SubtitleTranslate - DeepSeek.ico")
+    if not os.path.isfile(main_as):
+        return
+    store_file = find_store_file()
+    if not store_file:
+        return
+    try:
+        with open(store_file, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        apis = data.get("apis", [])
+        if not apis:
+            return
+        with open(main_as, "r", encoding="utf-8") as fh:
+            template = fh.read()
+    except Exception as exc:
+        print(f"读取配置失败: {exc}")
+        return
+
+    used = set()
+    for api in apis:
+        name = api.get("name", "").strip()
+        if not name:
+            continue
+        base = f"SubtitleTranslate - DeepSeek ({safe_entry_name(name)}).as"
+        fname = base
+        k = 2
+        while fname.lower() in used:
+            fname = base[:-4] + f" {k}.as"
+            k += 1
+        used.add(fname.lower())
+
+        entry_path = os.path.join(target_path, fname)
+        try:
+            content = make_entry_source_from_template(template, api)
+            with open(entry_path, "w", encoding="utf-8", newline="\r\n") as fh:
+                fh.write(content)
+            print(f"  [OK] 自动安装已保存的 API 条目: {fname}")
+            if os.path.isfile(main_ico):
+                ico_dst = os.path.join(target_path, fname[:-4] + ".ico")
+                shutil.copyfile(main_ico, ico_dst)
+        except Exception as exc:
+            print(f"  [WARN] 写入 {fname} 失败: {exc}")
 
 
 def upgrade_custom_entries(target_path, strings):
