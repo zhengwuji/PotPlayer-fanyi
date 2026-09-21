@@ -611,12 +611,20 @@ class JetHubTranslator:
             batch_slice = texts[start_i:end_i]
 
             numbered_lines = [f"{i}: {t.strip()}" for i, t in enumerate(batch_slice, 1)]
-            user_prompt = "\n".join(numbered_lines)
+
+            # 上下文滑动窗口：提取上一批的最后 2 句作为参考上下文
+            context_header = ""
+            if start_i > 0:
+                prev_lines = [p.replace("\r", " ").replace("\n", " ").strip() for p in texts[max(0, start_i - 2):start_i]]
+                prev_text = " / ".join(prev_lines)
+                context_header = f"【前文对白参考（仅供语境与代词理解，绝不要翻译）】：{prev_text}\n\n"
+
+            user_prompt = f"{context_header}【待翻译字幕（请按编号逐行输出译文）】：\n" + "\n".join(numbered_lines)
 
             sys_prompt = (
                 f"你是一名顶级的影视字幕翻译专家。\n"
                 f"任务：将用户给出的字幕对白按编号逐行翻译为自然流畅地道的{dst_name}。\n"
-                f"规则：严格保留编号“1: 译文”，仅输出编号和译文，严禁输出任何解释说明。"
+                f"规则：严格保留编号“1: 译文”，仅输出编号和译文，严禁输出任何解释说明。若提供【前文对白参考】，仅供理解语境，严禁翻译或输出。"
             )
             if src_lang and src_lang != "auto":
                 sys_prompt += f"\n原文语种：{src_lang}。"

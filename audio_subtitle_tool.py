@@ -561,7 +561,15 @@ class LlmTranslator:
             for sub_i, line_text in enumerate(batch_slice, 1):
                 clean_t = line_text.replace("\r", " ").replace("\n", " ").strip()
                 numbered_lines.append(f"{sub_i}: {clean_t}")
-            user_prompt = "\n".join(numbered_lines)
+
+            # 上下文滑动窗口：提取上一批的最后 2 句作为参考上下文，消除断句与代词代指混淆
+            context_header = ""
+            if start_i > 0:
+                prev_lines = [p.replace("\r", " ").replace("\n", " ").strip() for p in texts[max(0, start_i - 2):start_i]]
+                prev_text = " / ".join(prev_lines)
+                context_header = f"【前文对白参考（仅供语境与代词理解，绝不要翻译）】：{prev_text}\n\n"
+
+            user_prompt = f"{context_header}【待翻译字幕（请按编号逐行输出译文）】：\n" + "\n".join(numbered_lines)
 
             sys_prompt = (
                 "你是一名顶级的影视字幕翻译专家。\n"
@@ -570,7 +578,8 @@ class LlmTranslator:
                 "1. 必须严格保留每一行的数字编号，格式如“1: 译文”，每行对应一条；\n"
                 "2. 仅输出翻译后的编号和译文，严禁输出任何解释、说明或原文；\n"
                 "3. 保证编号数量与原文完全一致，严禁遗漏任何一条；\n"
-                "4. 极速直译要求：无需展开长篇推理或剧情分析，以最短思考极速输出标准译文。"
+                "4. 极速直译要求：无需展开长篇推理或剧情分析，以最短思考极速输出标准译文；\n"
+                "5. 若提供了【前文对白参考】，仅用于辅助理解角色代词与前后语境，严禁翻译或输出该参考内容。"
             )
             if src_lang and src_lang != "auto":
                 sys_prompt += f"\n原文语种参考：{src_lang}。"
@@ -912,7 +921,9 @@ class VideoSubtitleMuxer:
 
         # 单引号包裹并转义特殊字符，完美兼容空格与各类括号命名（如 [Sub] title.srt）
         esc_srt = srt_file.replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
-        vf_param = f"subtitles='{esc_srt}'"
+        # 优化字幕渲染样式：清晰高对比度描边（白字、黑边、半透明投影、底部适中边距），确保浅色/复杂视频背景下清晰可见
+        sub_style = "FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.6,Shadow=0.8,MarginV=24"
+        vf_param = f"subtitles='{esc_srt}':force_style='{sub_style}'"
 
         cmd = [ffmpeg, "-nostdin", "-y", "-i", os.path.abspath(video_path), "-vf", vf_param]
         if use_nvenc:
