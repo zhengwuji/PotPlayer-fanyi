@@ -837,9 +837,19 @@ class VideoSubtitleMuxer:
             prog(100, f"{action_title}完成！")
             return True, ""
         else:
-            err_msg = "".join(stderr_buffer[-20:])
-            log(f"[{action_title}失败]: {err_msg[:200]}")
-            return False, err_msg
+            # 智能提取最有价值的真实错误提示行，杜绝无用字体引擎初始化信息刷屏
+            err_candidates = [
+                l.strip() for l in stderr_buffer 
+                if any(k in l.lower() for k in ["error", "invalid", "failed", "could not", "not supported", "cannot", "abort"])
+                and not any(ign in l.lower() for ign in ["error_resilient", "errors=ignore"])
+            ]
+            if err_candidates:
+                err_detail = " | ".join(err_candidates[-3:])
+            else:
+                err_detail = "".join(stderr_buffer[-5:]).strip()
+            log(f"[{action_title}失败]: {err_detail[:300]}")
+            write_runtime_log(f"[{action_title}详细失败日志 (returncode={proc.returncode})]\n" + "".join(stderr_buffer[-25:]))
+            return False, err_detail
 
     @classmethod
     def mux_soft_subtitle(cls, video_path, srt_path, out_path=None, log_cb=None, progress_cb=None, cancel_checker=None):
@@ -894,6 +904,8 @@ class VideoSubtitleMuxer:
         硬字幕画面压制（Hard Subtitle Burn-in）：
         将字幕直接渲染烙印到视频画面中，兼容所有无外挂字幕支持的播放器与移动设备。
         自动检测 NVIDIA NVENC 显卡硬件加速，带实时压制时间与百分比进度。
+        已内置 -pix_fmt yuv420p 自动像素格式转换（完美解决 10-bit HEVC 视频压制报错）。
+        若 NVENC 遇到硬件或显存异常，自动无缝回退至 CPU (libx264) 压制。
         """
         log = log_cb or (lambda x: None)
         ffmpeg = find_ffmpeg()
@@ -928,10 +940,11 @@ class VideoSubtitleMuxer:
         cmd = [ffmpeg, "-nostdin", "-y", "-i", os.path.abspath(video_path), "-vf", vf_param]
         if use_nvenc:
             log(f"[硬字幕压制] 启用 NVIDIA NVENC 显卡硬件加速压制 (GPU {gpu_idx})...")
-            cmd.extend(["-c:v", "h264_nvenc", "-gpu", str(gpu_idx), "-preset", "p4", "-cq", "22"])
+            # 强制指定 -pix_fmt yuv420p，防止 10-bit HEVC/HDR 片源导致 nvenc 报错 "10-bit encoding not supported with this profile"
+            cmd.extend(["-c:v", "h264_nvenc", "-gpu", str(gpu_idx), "-preset", "p4", "-cq", "22", "-pix_fmt", "yuv420p"])
         else:
             log("[硬字幕压制] 使用 CPU (libx264) 压制字幕画面...")
-            cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "21"])
+            cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "21", "-pix_fmt", "yuv420p"])
 
         cmd.extend(["-c:a", "copy", os.path.abspath(out_path)])
 
@@ -947,6 +960,22 @@ class VideoSubtitleMuxer:
             progress_cb=progress_cb,
             cancel_checker=cancel_checker
         )
+
+        # 若 NVENC 压制失败（如驱动异常或显存不足），且用户未主动取消，自动无缝回退到 CPU 压制
+        if not ok and use_nvenc and not (cancel_checker and cancel_checker()):
+            log("[硬字幕压制] NVENC 硬件加速遇到异常，正在自动回退至 CPU (libx264) 压制...")
+            cmd_cpu = [ffmpeg, "-nostdin", "-y", "-i", os.path.abspath(video_path), "-vf", vf_param]
+            cmd_cpu.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "21", "-pix_fmt", "yuv420p"])
+            cmd_cpu.extend(["-c:a", "copy", os.path.abspath(out_path)])
+            ok, err = cls._run_ffmpeg_stream_progress(
+                cmd=cmd_cpu,
+                cwd=srt_dir,
+                total_dur=total_dur,
+                action_title="CPU硬字幕压制",
+                log_cb=log,
+                progress_cb=progress_cb,
+                cancel_checker=cancel_checker
+            )
 
         if ok and os.path.isfile(out_path):
             log(f"[硬字幕成功] 视频画面硬字幕压制完成！输出视频: {out_path}")
@@ -967,11 +996,14 @@ class SubtitleFilePipeline:
     def cancel(self):
         self.cancelled = True
 
-    def process(self, srt_path, video_path="", src_lang="auto", dst_lang="zh-CN", dual_mode=False, mux_mode="none"):
+    def process(self, srt_path, video_path="", src_lang="auto", dst_lang="zh-CN", dual_mode=False, mux_mode="none", gpu_idx=0):
         self.cancelled = False
-        if not os.path.isfile(srt_path):
+        if not srt_path or not os.path.isfile(srt_path):
             self.log_callback(f"[错误] 找不到字幕文件: {srt_path}")
             return False
+        srt_path = os.path.normpath(os.path.abspath(srt_path))
+        if video_path:
+            video_path = os.path.normpath(os.path.abspath(video_path))
 
         self.progress_callback(5, "正在读取并解析字幕文件...")
         self.log_callback(f"[字幕翻译] 解析字幕文件: {os.path.basename(srt_path)}")
@@ -1077,9 +1109,10 @@ class VideoSrtPipeline:
 
     def process(self, video_path, model_name="small", src_lang=None, dst_lang="zh-CN", dual_mode=False, mux_mode="none", gpu_idx=0):
         self.cancelled = False
-        if not os.path.isfile(video_path):
+        if not video_path or not os.path.isfile(video_path):
             self.log_callback(f"[错误] 找不到视频文件: {video_path}")
             return False
+        video_path = os.path.normpath(os.path.abspath(video_path))
 
         ffmpeg = find_ffmpeg()
         if not ffmpeg:
