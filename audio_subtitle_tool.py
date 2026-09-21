@@ -724,20 +724,34 @@ class VideoSubtitleMuxer:
 
     @staticmethod
     def get_video_duration(video_path):
-        """快速探测视频文件的总播放时长（秒）"""
-        ffmpeg = find_ffmpeg()
-        if not ffmpeg or not os.path.isfile(video_path):
+        """快速探测视频文件的总播放时长（秒），优先使用 ffprobe，回退至 ffmpeg"""
+        if not video_path or not os.path.isfile(video_path):
             return 0
-        try:
-            vp = os.path.abspath(video_path)
-            cmd = [ffmpeg, "-i", vp]
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="ignore")
-            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr)
-            if m:
-                h, m_, s = m.groups()
-                return int(h) * 3600 + int(m_) * 60 + float(s)
-        except Exception:
-            pass
+        vp = os.path.abspath(video_path)
+        ffmpeg = find_ffmpeg()
+        # 优先使用同目录下的 ffprobe 获取精确时长
+        if ffmpeg:
+            ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe.exe" if os.name == "nt" else "ffprobe")
+            if os.path.isfile(ffprobe):
+                try:
+                    cmd_p = [ffprobe, "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", vp]
+                    r = subprocess.run(cmd_p, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="ignore", timeout=5)
+                    val = float(r.stdout.strip())
+                    if val > 0:
+                        return val
+                except Exception:
+                    pass
+        # 回退到 ffmpeg -i 读取 Duration 标签
+        if ffmpeg:
+            try:
+                cmd = [ffmpeg, "-i", vp]
+                res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="ignore", timeout=5)
+                m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", res.stderr)
+                if m:
+                    h, m_, s = m.groups()
+                    return int(h) * 3600 + int(m_) * 60 + float(s)
+            except Exception:
+                pass
         return 0
 
     @classmethod
@@ -757,7 +771,7 @@ class VideoSubtitleMuxer:
             proc = subprocess.Popen(
                 cmd,
                 cwd=cwd,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 text=True,
                 errors="ignore",
@@ -838,7 +852,7 @@ class VideoSubtitleMuxer:
 
         sub_codec = "srt" if out_path.lower().endswith(".mkv") else "mov_text"
         cmd = [
-            ffmpeg, "-y",
+            ffmpeg, "-nostdin", "-y",
             "-i", os.path.abspath(video_path),
             "-i", os.path.abspath(srt_path),
             "-c", "copy",
@@ -896,10 +910,11 @@ class VideoSubtitleMuxer:
         srt_dir = os.path.dirname(os.path.abspath(srt_path))
         srt_file = os.path.basename(srt_path)
 
-        # 滤镜参数
-        vf_param = f"subtitles={srt_file}"
+        # 单引号包裹并转义特殊字符，完美兼容空格与各类括号命名（如 [Sub] title.srt）
+        esc_srt = srt_file.replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+        vf_param = f"subtitles='{esc_srt}'"
 
-        cmd = [ffmpeg, "-y", "-i", os.path.abspath(video_path), "-vf", vf_param]
+        cmd = [ffmpeg, "-nostdin", "-y", "-i", os.path.abspath(video_path), "-vf", vf_param]
         if use_nvenc:
             log(f"[硬字幕压制] 启用 NVIDIA NVENC 显卡硬件加速压制 (GPU {gpu_idx})...")
             cmd.extend(["-c:v", "h264_nvenc", "-gpu", str(gpu_idx), "-preset", "p4", "-cq", "22"])
