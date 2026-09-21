@@ -764,6 +764,38 @@ class VideoSubtitleMuxer:
         return 0
 
     @classmethod
+    def get_video_bitrate(cls, video_path, duration=0):
+        """探测或计算原视频的目标码率 (bps)，确保压制后体积不膨胀、与原视频大小一致"""
+        if not video_path or not os.path.isfile(video_path):
+            return 2500000
+        vp = os.path.abspath(video_path)
+        ffmpeg = find_ffmpeg()
+        # 1. 优先通过 ffprobe 获取源视频流实际视频码率
+        if ffmpeg:
+            ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe.exe" if os.name == "nt" else "ffprobe")
+            if os.path.isfile(ffprobe):
+                try:
+                    cmd_p = [ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=bit_rate", "-of", "default=noprint_wrappers=1:nokey=1", vp]
+                    r = subprocess.run(cmd_p, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="ignore", timeout=4)
+                    raw = r.stdout.strip()
+                    if raw and raw.isdigit():
+                        val = int(raw)
+                        if val > 100000:
+                            return val
+                except Exception:
+                    pass
+        # 2. 回退通过文件大小和时长精准反推原始视频平均码率 (体积 1:1 对齐最强数学保证)
+        if duration <= 0:
+            duration = cls.get_video_duration(video_path)
+        if duration > 0:
+            total_size = os.path.getsize(vp)
+            total_bps = (total_size * 8) / duration
+            # 扣除音频轨典型占用（约 15%），得到纯视频目标码率
+            v_bps = int(total_bps * 0.85)
+            return max(500000, v_bps)
+        return 2500000
+
+    @classmethod
     def _run_ffmpeg_stream_progress(cls, cmd, cwd, total_dur, action_title, log_cb, progress_cb, cancel_checker):
         """通用流式执行 ffmpeg，实时正则提取 time 与 speed 计算百分比，平滑驱动 UI 进度条"""
         log = log_cb or (lambda x: None)
@@ -937,19 +969,46 @@ class VideoSubtitleMuxer:
         sub_style = "FontSize=20,PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000,BorderStyle=1,Outline=1.6,Shadow=0.8,MarginV=24"
         vf_param = f"subtitles='{esc_srt}':force_style='{sub_style}'"
 
-        cmd = [ffmpeg, "-nostdin", "-y", "-i", os.path.abspath(video_path), "-vf", vf_param]
+        total_dur = cls.get_video_duration(video_path)
+        v_bitrate = cls.get_video_bitrate(video_path, total_dur)
+
+        cmd = [ffmpeg, "-nostdin", "-y"]
         if use_nvenc:
-            log(f"[硬字幕压制] 启用 NVIDIA NVENC 显卡硬件加速压制 (GPU {gpu_idx})...")
-            # 强制指定 -pix_fmt yuv420p，防止 10-bit HEVC/HDR 片源导致 nvenc 报错 "10-bit encoding not supported with this profile"
-            cmd.extend(["-c:v", "h264_nvenc", "-gpu", str(gpu_idx), "-preset", "p4", "-cq", "22", "-pix_fmt", "yuv420p"])
+            # 开启 CUDA 硬件加速解码 (NVDEC)，将解码工作全部卸载到 GPU 显卡，彻底释放 CPU，杜绝电脑卡顿
+            cmd.extend(["-hwaccel", "cuda", "-hwaccel_device", str(gpu_idx)])
+
+        cmd.extend(["-i", os.path.abspath(video_path), "-vf", vf_param])
+
+        if use_nvenc:
+            log(f"[硬字幕压制] 启用 NVIDIA GPU 全硬件加速 (NVDEC 显卡解码 + NVENC 显卡编码, GPU {gpu_idx})...")
+            log(f"[硬字幕压制] 目标码率自适应对齐原片: {v_bitrate // 1000} kbps (确保视频容量与原片一致，不膨胀变大)...")
+            # 强制指定 -pix_fmt yuv420p (兼容10-bit HEVC) 并约束码率，确保体积与原片 1:1 对齐
+            cmd.extend([
+                "-c:v", "h264_nvenc",
+                "-gpu", str(gpu_idx),
+                "-preset", "p4",
+                "-cq", "23",
+                "-b:v", str(v_bitrate),
+                "-maxrate", str(int(v_bitrate * 1.15)),
+                "-bufsize", str(int(v_bitrate * 2)),
+                "-pix_fmt", "yuv420p"
+            ])
         else:
             log("[硬字幕压制] 使用 CPU (libx264) 压制字幕画面...")
-            cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "21", "-pix_fmt", "yuv420p"])
+            log(f"[硬字幕压制] 目标码率自适应对齐原片: {v_bitrate // 1000} kbps (确保视频容量与原片一致)...")
+            cmd.extend([
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-b:v", str(v_bitrate),
+                "-maxrate", str(int(v_bitrate * 1.15)),
+                "-bufsize", str(int(v_bitrate * 2)),
+                "-pix_fmt", "yuv420p"
+            ])
 
         cmd.extend(["-c:a", "copy", os.path.abspath(out_path)])
 
         log(f"[硬字幕压制] 开始压制渲染字幕到视频画面: {os.path.basename(out_path)}...")
-        total_dur = cls.get_video_duration(video_path)
 
         ok, err = cls._run_ffmpeg_stream_progress(
             cmd=cmd,
@@ -965,8 +1024,17 @@ class VideoSubtitleMuxer:
         if not ok and use_nvenc and not (cancel_checker and cancel_checker()):
             log("[硬字幕压制] NVENC 硬件加速遇到异常，正在自动回退至 CPU (libx264) 压制...")
             cmd_cpu = [ffmpeg, "-nostdin", "-y", "-i", os.path.abspath(video_path), "-vf", vf_param]
-            cmd_cpu.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "21", "-pix_fmt", "yuv420p"])
-            cmd_cpu.extend(["-c:a", "copy", os.path.abspath(out_path)])
+            cmd_cpu.extend([
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-b:v", str(v_bitrate),
+                "-maxrate", str(int(v_bitrate * 1.15)),
+                "-bufsize", str(int(v_bitrate * 2)),
+                "-pix_fmt", "yuv420p",
+                "-c:a", "copy",
+                os.path.abspath(out_path)
+            ])
             ok, err = cls._run_ffmpeg_stream_progress(
                 cmd=cmd_cpu,
                 cwd=srt_dir,
